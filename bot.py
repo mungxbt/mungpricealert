@@ -8,8 +8,6 @@ alerts = {}           # price alerts: {user_id: [{symbol, target, direction}]}
 funding_watch = {}    # funding monitors: {user_id: [symbol, ...]}
 oi_watch = {}         # OI monitors: {user_id: [symbol, ...]}
 oi_cache = {}         # OI cache untuk deteksi spike: {symbol: last_oi}
-liq_watch = {}        # Liquidation monitors: {user_id: [symbol, ...]}
-liq_cache = {}        # Liquidation cache: {symbol: last_liq_value}
 
 # ─────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -90,6 +88,48 @@ async def get_open_interest(symbol: str) -> float | None:
         pass
     return None
 
+async def get_fear_greed() -> dict | None:
+    """Ambil Fear & Greed Index dari alternative.me."""
+    url = "https://api.alternative.me/fng/?limit=2"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["data"]
+    except Exception:
+        pass
+    return None
+
+async def get_dominance() -> dict | None:
+    """Ambil BTC & ETH dominance dari CoinGecko (gratis, no key)."""
+    url = "https://api.coingecko.com/api/v3/global"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["data"]
+    except Exception:
+        pass
+    return None
+
+async def get_heatmap(limit: int = 10) -> list:
+    """Ambil top coin by volume 24h dari Binance Futures sebagai proxy heatmap."""
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    result = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    tickers = await resp.json()
+                    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+                    sorted_by_vol = sorted(usdt, key=lambda x: float(x["quoteVolume"]), reverse=True)
+                    result = sorted_by_vol[:limit]
+    except Exception:
+        pass
+    return result
+
 async def get_long_short_ratio(symbol: str, period: str = "5m") -> dict | None:
     """Ambil Long/Short Ratio dari Binance Futures."""
     symbol = symbol.upper()
@@ -106,57 +146,6 @@ async def get_long_short_ratio(symbol: str, period: str = "5m") -> dict | None:
     except Exception:
         pass
     return None
-
-async def get_large_trades(symbol: str, min_usdt: float = 500_000) -> list:
-    """Ambil recent trades besar dari Binance Futures."""
-    symbol = symbol.upper()
-    if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
-    url = f"https://fapi.binance.com/fapi/v1/trades?symbol={symbol}&limit=200"
-    whales = []
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    trades = await resp.json()
-                    price = await get_price(symbol)
-                    if price:
-                        for t in trades:
-                            qty = float(t["qty"])
-                            value_usd = qty * price
-                            if value_usd >= min_usdt:
-                                whales.append({
-                                    "side": "SELL" if t["isBuyerMaker"] else "BUY",
-                                    "qty": qty,
-                                    "value_usd": value_usd,
-                                    "price": float(t["price"]),
-                                })
-    except Exception:
-        pass
-    return whales
-
-async def get_liquidations(symbol: str) -> list:
-    """Ambil data liquidation terbaru dari Binance Futures."""
-    symbol = symbol.upper()
-    if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
-    url = f"https://fapi.binance.com/fapi/v1/allForceOrders?symbol={symbol}&limit=10"
-    result = []
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for item in data:
-                        result.append({
-                            "side": item.get("side", "?"),
-                            "qty": float(item.get("origQty", 0)),
-                            "price": float(item.get("price", 0)),
-                            "value_usd": float(item.get("origQty", 0)) * float(item.get("price", 0)),
-                        })
-    except Exception:
-        pass
-    return result
 
 async def get_top_movers(limit: int = 5) -> tuple[list, list]:
     """Ambil top gainers & losers dari Binance Futures 24h."""
@@ -213,17 +202,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/listoi — lihat OI monitor\n\n"
         "⚖️ LONG/SHORT RATIO\n"
         "/lsr BTC — cek L/S ratio sekarang\n\n"
-        "🐳 WHALE ALERT\n"
-        "/whale BTC — cek large trades terbaru\n"
-        "/whale BTC 1000000 — custom min (USD)\n\n"
-        "💥 LIQUIDATION\n"
-        "/liq BTC — cek liquidation terbaru\n"
-        "/addliq BTC — monitor liquidation spike\n"
-        "/removeliq BTC — hapus monitor\n"
-        "/listliq — lihat liquidation monitor\n\n"
         "🏆 TOP MOVERS\n"
         "/topgainers — top 5 coin naik 24h\n"
-        "/toplosers — top 5 coin turun 24h\n"
+        "/toplosers — top 5 coin turun 24h\n\n"
+        "😱 MARKET SENTIMENT\n"
+        "/feargreed — Fear & Greed Index\n"
+        "/dominance — BTC & ETH dominance\n"
+        "/heatmap — coin paling ramai ditrading\n"
     )
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,127 +460,106 @@ async def lsr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ─────────────────────────────────────────
-# NEW: WHALE ALERT
+# NEW: FEAR & GREED INDEX
 # ─────────────────────────────────────────
 
-async def whale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Format: /whale BTC atau /whale BTC 1000000")
+async def feargreed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await get_fear_greed()
+    if not data:
+        await update.message.reply_text("❌ Gagal mengambil Fear & Greed Index.")
         return
 
-    symbol = context.args[0].upper()
-    min_usdt = 500_000
-    if len(context.args) > 1:
-        try:
-            min_usdt = float(context.args[1])
-        except ValueError:
-            pass
+    today = data[0]
+    yesterday = data[1] if len(data) > 1 else None
 
-    await update.message.reply_text(f"🔍 Scanning large trades {symbol}USDT...")
-    whales = await get_large_trades(symbol, min_usdt)
+    value = int(today["value"])
+    label = today["value_classification"]
 
-    if not whales:
-        await update.message.reply_text(
-            f"🐳 Tidak ada trade ≥ ${min_usdt:,.0f} ditemukan di {symbol} belakangan ini."
-        )
-        return
-
-    msg = f"🐳 Whale Alert — {symbol}USDT\n"
-    msg += f"Min size: ${min_usdt:,.0f}\n\n"
-    for w in whales[:10]:
-        emoji = "🟢" if w["side"] == "BUY" else "🔴"
-        msg += f"{emoji} {w['side']} {w['qty']:,.2f} @ ${w['price']:,.4f}\n"
-        msg += f"   ≈ ${w['value_usd']:,.0f}\n"
-    if len(whales) > 10:
-        msg += f"\n...dan {len(whales) - 10} trade lainnya"
-
-    await update.message.reply_text(msg)
-
-# ─────────────────────────────────────────
-# NEW: LIQUIDATION
-# ─────────────────────────────────────────
-
-async def liq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Format: /liq BTC")
-        return
-    symbol = context.args[0].upper()
-    liqs = await get_liquidations(symbol)
-
-    if not liqs:
-        await update.message.reply_text(
-            f"💥 Tidak ada data liquidation terbaru untuk {symbol}.\n"
-            f"(Binance mungkin tidak menyediakan data ini secara publik saat ini)"
-        )
-        return
-
-    total_long_liq = sum(l["value_usd"] for l in liqs if l["side"] == "SELL")
-    total_short_liq = sum(l["value_usd"] for l in liqs if l["side"] == "BUY")
-
-    msg = f"💥 {symbol} Liquidation Terbaru\n\n"
-    msg += f"🔴 Long Liq  : ${total_long_liq:,.0f}\n"
-    msg += f"🟢 Short Liq : ${total_short_liq:,.0f}\n\n"
-
-    for l in liqs[:8]:
-        side_label = "LONG LIQ" if l["side"] == "SELL" else "SHORT LIQ"
-        emoji = "🔴" if l["side"] == "SELL" else "🟢"
-        msg += f"{emoji} {side_label}: {l['qty']:,.2f} @ ${l['price']:,.4f} ≈ ${l['value_usd']:,.0f}\n"
-
-    if total_long_liq > total_short_liq * 2:
-        msg += "\n⚠️ Banyak Long kena liq → potensi reversal naik"
-    elif total_short_liq > total_long_liq * 2:
-        msg += "\n⚠️ Banyak Short kena liq → potensi reversal turun"
-
-    await update.message.reply_text(msg)
-
-async def add_liq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Format: /addliq BTC")
-        return
-    symbol = context.args[0].upper()
-    oi = await get_open_interest(symbol)
-    if oi is None:
-        await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Futures Binance.")
-        return
-    if user_id not in liq_watch:
-        liq_watch[user_id] = []
-    if symbol not in liq_watch[user_id]:
-        liq_watch[user_id].append(symbol)
-    liq_cache[symbol] = oi
-    await update.message.reply_text(
-        f"✅ Monitor liquidation spike {symbol} aktif!\n"
-        f"Notif kalau OI drop > 5% dalam 1 jam (indikasi liquidation masif)\n"
-        f"OI sekarang: {oi:,.2f}"
-    )
-
-async def remove_liq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Format: /removeliq BTC")
-        return
-    symbol = context.args[0].upper()
-    if user_id in liq_watch and symbol in liq_watch[user_id]:
-        liq_watch[user_id].remove(symbol)
-        await update.message.reply_text(f"✅ Monitor liquidation {symbol} dihapus.")
+    if value <= 25:
+        emoji = "😱"
+    elif value <= 45:
+        emoji = "😟"
+    elif value <= 55:
+        emoji = "😐"
+    elif value <= 75:
+        emoji = "😊"
     else:
-        await update.message.reply_text(f"❌ {symbol} tidak ada di liquidation monitor list.")
+        emoji = "🤑"
 
-async def list_liq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    watchlist = liq_watch.get(user_id, [])
-    if not watchlist:
-        await update.message.reply_text("Tidak ada liquidation monitor aktif.")
-        return
-    msg = "💥 Liquidation Monitor aktif:\n\n"
-    for symbol in watchlist:
-        oi = await get_open_interest(symbol)
-        msg += f"• {symbol}: OI {oi:,.2f}\n" if oi else f"• {symbol}: -\n"
+    msg = f"😱 Fear & Greed Index\n\n"
+    msg += f"{emoji} Sekarang : {value}/100 — {label}\n"
+    if yesterday:
+        y_val = int(yesterday["value"])
+        y_label = yesterday["value_classification"]
+        diff = value - y_val
+        arrow = "📈" if diff > 0 else "📉" if diff < 0 else "➡️"
+        msg += f"{arrow} Kemarin  : {y_val}/100 — {y_label}\n"
+        msg += f"   Perubahan: {diff:+d}\n"
+
+    msg += "\n📊 Skala:\n"
+    msg += "0-25: Extreme Fear 😱\n"
+    msg += "26-45: Fear 😟\n"
+    msg += "46-55: Neutral 😐\n"
+    msg += "56-75: Greed 😊\n"
+    msg += "76-100: Extreme Greed 🤑"
+
     await update.message.reply_text(msg)
 
 # ─────────────────────────────────────────
-# NEW: TOP GAINERS / LOSERS
+# NEW: BTC/ETH DOMINANCE
 # ─────────────────────────────────────────
+
+async def dominance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await get_dominance()
+    if not data:
+        await update.message.reply_text("❌ Gagal mengambil data dominance.")
+        return
+
+    market_cap_pct = data.get("market_cap_percentage", {})
+    btc_dom = market_cap_pct.get("btc", 0)
+    eth_dom = market_cap_pct.get("eth", 0)
+    others = 100 - btc_dom - eth_dom
+
+    total_mcap = data.get("total_market_cap", {}).get("usd", 0)
+    total_vol = data.get("total_volume", {}).get("usd", 0)
+
+    btc_bar = "█" * int(btc_dom / 5) + "░" * (20 - int(btc_dom / 5))
+    eth_bar = "█" * int(eth_dom / 5) + "░" * (20 - int(eth_dom / 5))
+
+    msg = f"📊 Crypto Market Dominance\n\n"
+    msg += f"₿ BTC : {btc_dom:.2f}%\n{btc_bar}\n\n"
+    msg += f"Ξ ETH : {eth_dom:.2f}%\n{eth_bar}\n\n"
+    msg += f"🪙 Altcoin: {others:.2f}%\n\n"
+    msg += f"💰 Total Market Cap : ${total_mcap/1e12:.2f}T\n"
+    msg += f"📈 Volume 24h        : ${total_vol/1e9:.1f}B"
+
+    await update.message.reply_text(msg)
+
+# ─────────────────────────────────────────
+# NEW: HEATMAP (TOP BY VOLUME)
+# ─────────────────────────────────────────
+
+async def heatmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 Fetching heatmap...")
+    coins = await get_heatmap(10)
+    if not coins:
+        await update.message.reply_text("❌ Gagal mengambil data heatmap.")
+        return
+
+    msg = "🔥 Heatmap — Paling Ramai Ditrading (Futures 24h)\n\n"
+    for i, t in enumerate(coins, 1):
+        sym = t["symbol"].replace("USDT", "")
+        vol = float(t["quoteVolume"])
+        pct = float(t["priceChangePercent"])
+        price = float(t["lastPrice"])
+        emoji = "🟢" if pct >= 0 else "🔴"
+        msg += f"{i:2}. {emoji} {sym:<6} {pct:+.2f}%\n"
+        msg += f"     ${price:,.4f} | Vol ${vol/1e6:.0f}M\n"
+
+    await update.message.reply_text(msg)
+
+# ─────────────────────────────────────────
+# BACKGROUND JOBS
 
 async def top_gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Fetching top gainers...")
@@ -704,35 +668,6 @@ async def check_oi_spikes(context: ContextTypes.DEFAULT_TYPE):
                         )
         oi_cache[symbol] = oi
 
-async def check_liq_spikes(context: ContextTypes.DEFAULT_TYPE):
-    """Deteksi liquidation spike dari OI drop mendadak."""
-    all_symbols = set()
-    for symbols in liq_watch.values():
-        all_symbols.update(symbols)
-
-    for symbol in all_symbols:
-        oi = await get_open_interest(symbol)
-        if oi is None:
-            continue
-        last_oi = liq_cache.get(symbol)
-        if last_oi:
-            change_pct = ((oi - last_oi) / last_oi) * 100
-            # OI drop tajam = banyak posisi kena liq/close paksa
-            if change_pct <= -5:
-                price = await get_price(symbol)
-                for user_id, symbols in liq_watch.items():
-                    if symbol in symbols:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=f"💥 LIQUIDATION SPIKE ALERT!\n\n"
-                                 f"📉 {symbol} OI drop {change_pct:.2f}% dalam 1 jam\n"
-                                 f"💰 Harga sekarang: ${price:,.4f}\n"
-                                 f"OI sekarang  : {oi:,.2f}\n"
-                                 f"OI sebelumnya: {last_oi:,.2f}\n\n"
-                                 f"⚠️ Kemungkinan banyak posisi kena likuidasi → potensi reversal!"
-                        )
-        liq_cache[symbol] = oi
-
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
@@ -765,24 +700,19 @@ def main():
     # Long/Short Ratio
     app.add_handler(CommandHandler("lsr", lsr_cmd))
 
-    # Whale Alert
-    app.add_handler(CommandHandler("whale", whale_cmd))
-
-    # Liquidation commands
-    app.add_handler(CommandHandler("liq", liq_cmd))
-    app.add_handler(CommandHandler("addliq", add_liq))
-    app.add_handler(CommandHandler("removeliq", remove_liq))
-    app.add_handler(CommandHandler("listliq", list_liq))
-
     # Top Movers
     app.add_handler(CommandHandler("topgainers", top_gainers_cmd))
     app.add_handler(CommandHandler("toplosers", top_losers_cmd))
+
+    # Market Sentiment
+    app.add_handler(CommandHandler("feargreed", feargreed_cmd))
+    app.add_handler(CommandHandler("dominance", dominance_cmd))
+    app.add_handler(CommandHandler("heatmap", heatmap_cmd))
 
     # Background jobs
     app.job_queue.run_repeating(check_price_alerts, interval=60, first=10)
     app.job_queue.run_repeating(check_funding_spikes, interval=3600, first=30)
     app.job_queue.run_repeating(check_oi_spikes, interval=3600, first=30)
-    app.job_queue.run_repeating(check_liq_spikes, interval=3600, first=60)
 
     print("Bot running...")
     app.run_polling()
