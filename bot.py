@@ -3,10 +3,10 @@ import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Store data
-alerts = {}           # price alerts: {user_id: [{symbol, target, direction}]}
-funding_watch = {}    # funding monitors: {user_id: [symbol, ...]}
-oi_watch = {}         # OI monitors: {user_id: [symbol, ...]}
+# Store data — key = chat_id (works for both DM and groups)
+alerts = {}           # price alerts: {chat_id: [{symbol, target, direction}]}
+funding_watch = {}    # funding monitors: {chat_id: [symbol, ...]}
+oi_watch = {}         # OI monitors: {chat_id: [symbol, ...]}
 oi_cache = {}         # OI cache untuk deteksi spike: {symbol: last_oi}
 
 # ─────────────────────────────────────────
@@ -236,7 +236,7 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💰 {symbol}/USDT: ${price:,.6f}")
 
 async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if len(context.args) < 2:
         await update.message.reply_text("Format: /alert BTC 90000")
         return
@@ -254,10 +254,10 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     direction = "above" if target > current else "below"
-    if user_id not in alerts:
-        alerts[user_id] = []
-    alerts[user_id] = [a for a in alerts[user_id] if a["symbol"] != symbol]
-    alerts[user_id].append({"symbol": symbol, "target": target, "direction": direction})
+    if chat_id not in alerts:
+        alerts[chat_id] = []
+    alerts[chat_id] = [a for a in alerts[chat_id] if a["symbol"] != symbol]
+    alerts[chat_id].append({"symbol": symbol, "target": target, "direction": direction})
 
     arrow = "📈" if direction == "above" else "📉"
     await update.message.reply_text(
@@ -267,8 +267,8 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_alerts = alerts.get(user_id, [])
+    chat_id = update.effective_chat.id
+    user_alerts = alerts.get(chat_id, [])
     if not user_alerts:
         await update.message.reply_text("Tidak ada price alert aktif.")
         return
@@ -279,15 +279,15 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def remove_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /removealert BTC")
         return
     symbol = context.args[0].upper()
-    if user_id in alerts:
-        before = len(alerts[user_id])
-        alerts[user_id] = [a for a in alerts[user_id] if a["symbol"] != symbol]
-        if len(alerts[user_id]) < before:
+    if chat_id in alerts:
+        before = len(alerts[chat_id])
+        alerts[chat_id] = [a for a in alerts[chat_id] if a["symbol"] != symbol]
+        if len(alerts[chat_id]) < before:
             await update.message.reply_text(f"✅ Alert {symbol} dihapus.")
             return
     await update.message.reply_text(f"❌ Tidak ada alert untuk {symbol}.")
@@ -311,7 +311,7 @@ async def funding_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def add_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /addfunding BTC")
         return
@@ -320,30 +320,30 @@ async def add_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rate is None:
         await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Futures Binance.")
         return
-    if user_id not in funding_watch:
-        funding_watch[user_id] = []
-    if symbol not in funding_watch[user_id]:
-        funding_watch[user_id].append(symbol)
+    if chat_id not in funding_watch:
+        funding_watch[chat_id] = []
+    if symbol not in funding_watch[chat_id]:
+        funding_watch[chat_id].append(symbol)
     await update.message.reply_text(
         f"✅ Monitor funding rate {symbol} aktif!\n"
         f"Notif kalau funding spike > 0.1% atau < -0.1%"
     )
 
 async def remove_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /removefunding BTC")
         return
     symbol = context.args[0].upper()
-    if user_id in funding_watch and symbol in funding_watch[user_id]:
-        funding_watch[user_id].remove(symbol)
+    if chat_id in funding_watch and symbol in funding_watch[chat_id]:
+        funding_watch[chat_id].remove(symbol)
         await update.message.reply_text(f"✅ Monitor funding {symbol} dihapus.")
     else:
         await update.message.reply_text(f"❌ {symbol} tidak ada di monitor list.")
 
 async def list_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    watchlist = funding_watch.get(user_id, [])
+    chat_id = update.effective_chat.id
+    watchlist = funding_watch.get(chat_id, [])
     if not watchlist:
         await update.message.reply_text("Tidak ada funding monitor aktif.")
         return
@@ -375,7 +375,7 @@ async def oi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /addoi BTC")
         return
@@ -384,10 +384,10 @@ async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if oi is None:
         await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Futures Binance.")
         return
-    if user_id not in oi_watch:
-        oi_watch[user_id] = []
-    if symbol not in oi_watch[user_id]:
-        oi_watch[user_id].append(symbol)
+    if chat_id not in oi_watch:
+        oi_watch[chat_id] = []
+    if symbol not in oi_watch[chat_id]:
+        oi_watch[chat_id].append(symbol)
     oi_cache[symbol] = oi
     await update.message.reply_text(
         f"✅ Monitor OI {symbol} aktif!\n"
@@ -396,20 +396,20 @@ async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def remove_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /removeoi BTC")
         return
     symbol = context.args[0].upper()
-    if user_id in oi_watch and symbol in oi_watch[user_id]:
-        oi_watch[user_id].remove(symbol)
+    if chat_id in oi_watch and symbol in oi_watch[chat_id]:
+        oi_watch[chat_id].remove(symbol)
         await update.message.reply_text(f"✅ Monitor OI {symbol} dihapus.")
     else:
         await update.message.reply_text(f"❌ {symbol} tidak ada di OI monitor list.")
 
 async def list_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    watchlist = oi_watch.get(user_id, [])
+    chat_id = update.effective_chat.id
+    watchlist = oi_watch.get(chat_id, [])
     if not watchlist:
         await update.message.reply_text("Tidak ada OI monitor aktif.")
         return
@@ -598,7 +598,7 @@ async def top_losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 
 async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
-    for user_id, user_alerts in list(alerts.items()):
+    for chat_id, user_alerts in list(alerts.items()):
         triggered = []
         remaining = []
         for a in user_alerts:
@@ -612,11 +612,11 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
                 triggered.append((a, price))
             else:
                 remaining.append(a)
-        alerts[user_id] = remaining
+        alerts[chat_id] = remaining
         for a, price in triggered:
             arrow = "📈" if a["direction"] == "above" else "📉"
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=chat_id,
                 text=f"🚨 PRICE ALERT KENA!\n\n"
                      f"{arrow} {a['symbol']} sudah sentuh ${a['target']:,.6f}\n"
                      f"💰 Harga sekarang: ${price:,.6f}"
@@ -633,11 +633,11 @@ async def check_funding_spikes(context: ContextTypes.DEFAULT_TYPE):
             continue
         pct = rate * 100
         if abs(pct) >= 0.1:
-            for user_id, symbols in funding_watch.items():
+            for chat_id, symbols in funding_watch.items():
                 if symbol in symbols:
                     status = funding_status(rate)
                     await context.bot.send_message(
-                        chat_id=user_id,
+                        chat_id=chat_id,
                         text=f"⚡ FUNDING SPIKE!\n\n"
                              f"📊 {symbol}: {pct:+.4f}%\n"
                              f"{status}"
@@ -656,11 +656,11 @@ async def check_oi_spikes(context: ContextTypes.DEFAULT_TYPE):
         if last_oi:
             change_pct = ((oi - last_oi) / last_oi) * 100
             if abs(change_pct) >= 10:
-                for user_id, symbols in oi_watch.items():
+                for chat_id, symbols in oi_watch.items():
                     if symbol in symbols:
                         arrow = "📈" if change_pct > 0 else "📉"
                         await context.bot.send_message(
-                            chat_id=user_id,
+                            chat_id=chat_id,
                             text=f"⚡ OI SPIKE!\n\n"
                                  f"{arrow} {symbol} OI berubah {change_pct:+.2f}%\n"
                                  f"OI sekarang: {oi:,.2f}\n"
