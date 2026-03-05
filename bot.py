@@ -113,7 +113,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔔 PRICE ALERT\n"
         "/alert BTC 90000 — alert harga\n"
         "/listalerts — lihat alert aktif\n"
-        "/cancelalert BTC — hapus alert\n\n"
+        "/removealert BTC — hapus alert\n\n"
         "📊 FUNDING RATE\n"
         "/funding BTC — cek funding rate\n"
         "/addfunding BTC — monitor spike funding\n"
@@ -193,10 +193,10 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{arrow} {a['symbol']} → ${a['target']:,.6f}\n"
     await update.message.reply_text(msg)
 
-async def cancel_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Format: /cancelalert BTC")
+        await update.message.reply_text("Format: /removealert BTC")
         return
     symbol = context.args[0].upper()
     if user_id in alerts:
@@ -427,7 +427,7 @@ def main():
     # Price alert commands
     app.add_handler(CommandHandler("alert", alert_cmd))
     app.add_handler(CommandHandler("listalerts", list_alerts))
-    app.add_handler(CommandHandler("cancelalert", cancel_alert))
+    app.add_handler(CommandHandler("removealert", remove_alert))
 
     # Funding commands
     app.add_handler(CommandHandler("funding", funding_cmd))
