@@ -106,7 +106,7 @@ def funding_status(rate: float) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Crypto Alert Bot by mungxbt\n"
-        "Powered by Binance API\n\n"
+        "@simpulcrypto\n\n"
         "📌 PRICE\n"
         "/price BTC — harga USD\n"
         "/price BTC IDR — harga Rupiah\n\n"
