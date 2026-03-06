@@ -1,12 +1,38 @@
 import os
+import json
 import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Store data
-alerts = {}           # price alerts: {user_id: [{symbol, target, direction}]}
-funding_watch = {}    # funding monitors: {user_id: [symbol, ...]}
-oi_watch = {}         # OI monitors: {user_id: [symbol, ...]}
+DATA_FILE = "data.json"
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+                # Convert string keys back to int (JSON keys are always strings)
+                alerts = {int(k): v for k, v in data.get("alerts", {}).items()}
+                funding_watch = {int(k): v for k, v in data.get("funding_watch", {}).items()}
+                oi_watch = {int(k): v for k, v in data.get("oi_watch", {}).items()}
+                return alerts, funding_watch, oi_watch
+        except Exception:
+            pass
+    return {}, {}, {}
+
+def save_data():
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump({
+                "alerts": alerts,
+                "funding_watch": funding_watch,
+                "oi_watch": oi_watch
+            }, f)
+    except Exception as e:
+        print(f"Error saving data: {e}")
+
+# Load persisted data on startup
+alerts, funding_watch, oi_watch = load_data()
 oi_cache = {}         # OI cache untuk deteksi spike: {symbol: last_oi}
 
 # ─────────────────────────────────────────
@@ -179,6 +205,7 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     alerts[user_id].append({"symbol": symbol, "target": target, "direction": direction})
+    save_data()
 
     arrow = "📈" if direction == "above" else "📉"
     total = len([a for a in alerts[user_id] if a["symbol"] == symbol])
@@ -224,6 +251,7 @@ async def remove_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             before = len(alerts[user_id])
             alerts[user_id] = [a for a in alerts[user_id] if not (a["symbol"] == symbol and a["target"] == target)]
             if len(alerts[user_id]) < before:
+                save_data()
                 await update.message.reply_text(f"✅ Alert {symbol} ${target:,.6f} dihapus.")
                 return
         await update.message.reply_text(f"❌ Alert {symbol} ${target:,.6f} tidak ditemukan.")
@@ -235,6 +263,7 @@ async def remove_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alerts[user_id] = [a for a in alerts[user_id] if a["symbol"] != symbol]
         removed = before - len(alerts[user_id])
         if removed > 0:
+            save_data()
             await update.message.reply_text(f"✅ {removed} alert {symbol} dihapus.")
             return
     await update.message.reply_text(f"❌ Tidak ada alert untuk {symbol}.")
@@ -271,6 +300,7 @@ async def add_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         funding_watch[user_id] = []
     if symbol not in funding_watch[user_id]:
         funding_watch[user_id].append(symbol)
+        save_data()
     await update.message.reply_text(
         f"✅ Monitor funding rate {symbol} aktif!\n"
         f"Notif kalau funding spike > 0.1% atau < -0.1%"
@@ -284,6 +314,7 @@ async def remove_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper()
     if user_id in funding_watch and symbol in funding_watch[user_id]:
         funding_watch[user_id].remove(symbol)
+        save_data()
         await update.message.reply_text(f"✅ Monitor funding {symbol} dihapus.")
     else:
         await update.message.reply_text(f"❌ {symbol} tidak ada di monitor list.")
@@ -336,6 +367,7 @@ async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if symbol not in oi_watch[user_id]:
         oi_watch[user_id].append(symbol)
     oi_cache[symbol] = oi
+    save_data()
     await update.message.reply_text(
         f"✅ Monitor OI {symbol} aktif!\n"
         f"Notif kalau OI spike > 10% dalam 1 jam\n"
@@ -350,6 +382,7 @@ async def remove_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper()
     if user_id in oi_watch and symbol in oi_watch[user_id]:
         oi_watch[user_id].remove(symbol)
+        save_data()
         await update.message.reply_text(f"✅ Monitor OI {symbol} dihapus.")
     else:
         await update.message.reply_text(f"❌ {symbol} tidak ada di OI monitor list.")
@@ -389,6 +422,8 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
             else:
                 remaining.append(a)
         alerts[user_id] = remaining
+        if triggered:
+            save_data()
         for a, price in triggered:
             arrow = "📈" if a["direction"] == "above" else "📉"
             await context.bot.send_message(
