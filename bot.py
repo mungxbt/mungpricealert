@@ -216,21 +216,155 @@ async def get_long_short_ratio(symbol: str, period: str = "5m") -> dict | None:
         pass
     return None
 
-async def get_top_movers(limit: int = 5) -> tuple[list, list]:
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+async def get_top_movers(limit: int = 5, market: str = "spot") -> tuple[list, list]:
+    """market = 'spot' (default, sama dengan Binance web) atau 'futures'"""
+    if market == "futures":
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    else:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
     gainers, losers = [], []
+    blacklist = ["UP", "DOWN", "BULL", "BEAR", "USDC", "TUSD", "FDUSD", "USDP"]
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     tickers = await resp.json()
-                    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+                    usdt = [
+                        t for t in tickers
+                        if t["symbol"].endswith("USDT")
+                        and float(t.get("quoteVolume", 0)) > 1_000_000
+                        and not any(x in t["symbol"].replace("USDT","") for x in blacklist)
+                    ]
                     sorted_tickers = sorted(usdt, key=lambda x: float(x["priceChangePercent"]), reverse=True)
                     gainers = sorted_tickers[:limit]
                     losers = sorted_tickers[-limit:][::-1]
     except Exception:
         pass
     return gainers, losers
+
+# ─────────────────────────────────────────
+# DEXSCREENER HELPERS
+# ─────────────────────────────────────────
+
+async def dex_search_pairs(query: str) -> list:
+    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("pairs", []) or []
+    except Exception:
+        pass
+    return []
+
+async def dex_by_contract(chain: str, address: str) -> list:
+    url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        return data
+                    return data.get("pairs", []) or []
+    except Exception:
+        pass
+    return []
+
+async def dex_trending_tokens() -> list:
+    url = "https://api.dexscreener.com/token-boosts/top/v1"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        return data
+    except Exception:
+        pass
+    return []
+
+async def dex_new_listings() -> list:
+    url = "https://api.dexscreener.com/token-profiles/latest/v1"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        return data
+    except Exception:
+        pass
+    return []
+
+async def dex_get_pair_detail(chain: str, address: str) -> dict | None:
+    """Ambil detail satu pair by pair address untuk cek marketcap aktual"""
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{address}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    return pairs[0] if pairs else None
+    except Exception:
+        pass
+    return None
+
+def format_price(price_usd: float) -> str:
+    if price_usd >= 1:
+        return f"${price_usd:,.4f}"
+    elif price_usd >= 0.0001:
+        return f"${price_usd:.6f}"
+    else:
+        return f"${price_usd:.10f}"
+
+def pct_emoji(v) -> str:
+    try:
+        return "🟢" if float(v) >= 0 else "🔴"
+    except:
+        return "⚪"
+
+def format_dex_pair(pair: dict) -> str:
+    base = pair.get("baseToken", {})
+    symbol = base.get("symbol", "?")
+    name = base.get("name", "?")
+    chain = pair.get("chainId", "?")
+    dex = pair.get("dexId", "?")
+    price_usd = float(pair.get("priceUsd") or 0)
+
+    pc = pair.get("priceChange", {})
+    p5m  = float(pc.get("m5") or 0)
+    p1h  = float(pc.get("h1") or 0)
+    p6h  = float(pc.get("h6") or 0)
+    p24h = float(pc.get("h24") or 0)
+
+    vol24 = float((pair.get("volume") or {}).get("h24") or 0)
+    liq_usd = float((pair.get("liquidity") or {}).get("usd") or 0)
+    fdv = float(pair.get("fdv") or 0)
+    mcap = float(pair.get("marketCap") or 0)
+
+    txns = (pair.get("txns") or {}).get("h24") or {}
+    buys = txns.get("buys", 0)
+    sells = txns.get("sells", 0)
+    pair_url = pair.get("url", "")
+
+    msg  = f"🔍 *{symbol}* — {name}\n"
+    msg += f"⛓ {chain.upper()} | 🏦 {dex}\n\n"
+    msg += f"💰 Harga   : {format_price(price_usd)}\n"
+    msg += f"📊 5m {pct_emoji(p5m)}{p5m:+.2f}% | 1h {pct_emoji(p1h)}{p1h:+.2f}%\n"
+    msg += f"   6h {pct_emoji(p6h)}{p6h:+.2f}% | 24h {pct_emoji(p24h)}{p24h:+.2f}%\n\n"
+    msg += f"💧 Liquidity : ${liq_usd:,.0f}\n"
+    msg += f"📦 Volume 24h: ${vol24:,.0f}\n"
+    if mcap > 0:
+        msg += f"🏆 Market Cap: ${mcap:,.0f}\n"
+    if fdv > 0:
+        msg += f"📈 FDV       : ${fdv:,.0f}\n"
+    msg += f"🔄 Txns 24h  : {buys} buy / {sells} sell\n"
+    if pair_url:
+        msg += f"\n🔗 {pair_url}"
+    return msg
 
 def funding_status(rate: float) -> str:
     pct = rate * 100
@@ -243,8 +377,7 @@ def funding_status(rate: float) -> str:
     else:
         return "🟡 Negatif → Short bayar Long"
 
-# ─────────────────────────────────────────
-# COMMANDS
+
 # ─────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,7 +390,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔔 PRICE ALERT\n"
         "/alert BTC 90000 — set alert harga\n"
         "/listalerts — lihat alert aktif\n"
-        "/removealert BTC 90000 — hapus alert spesifik\n"
+        "/removealert BTC 90000 — hapus spesifik\n"
         "/removealert BTC — hapus semua alert BTC\n\n"
         "📊 FUNDING RATE\n"
         "/funding BTC — cek funding rate\n"
@@ -272,12 +405,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚖️ LONG/SHORT RATIO\n"
         "/lsr BTC — cek L/S ratio\n\n"
         "🏆 TOP MOVERS\n"
-        "/topgainers — top 5 coin naik 24h\n"
-        "/toplosers — top 5 coin turun 24h\n\n"
+        "/topgainers — top 5 naik 24h (spot)\n"
+        "/topgainers futures — versi futures\n"
+        "/toplosers — top 5 turun 24h (spot)\n\n"
         "😱 MARKET SENTIMENT\n"
         "/feargreed — Fear & Greed Index\n"
         "/dominance — BTC & ETH dominance\n"
-        "/heatmap — coin paling ramai ditrading\n"
+        "/heatmap — coin paling ramai ditrading\n\n"
+        "🦎 DEX / MEMECOIN\n"
+        "/dex PEPE — cari token by nama\n"
+        "/dex solana <contract> — by contract\n"
+        "/dexalert <contract> <mcap> — alert marketcap\n"
+        "/listdexalerts — lihat dex alert\n"
+        "/removedexalert <contract> — hapus alert\n"
+        "/dextrending — token paling banyak di-boost\n"
+        "/dexnew — token baru listing\n"
     )
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,11 +790,14 @@ async def heatmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Fetching top gainers...")
-    gainers, _ = await get_top_movers(5)
+    # default spot (sama dengan web Binance), bisa tambah 'futures' sbg arg
+    market = "futures" if context.args and context.args[0].lower() == "futures" else "spot"
+    gainers, _ = await get_top_movers(5, market)
     if not gainers:
         await update.message.reply_text("❌ Gagal mengambil data. Coba lagi.")
         return
-    msg = "🏆 Top 5 Gainers (Futures 24h)\n\n"
+    label = "Spot" if market == "spot" else "Futures"
+    msg = f"🏆 Top 5 Gainers ({label} 24h)\n\n"
     for i, t in enumerate(gainers, 1):
         sym = t["symbol"].replace("USDT", "")
         pct = float(t["priceChangePercent"])
@@ -664,11 +809,13 @@ async def top_gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Fetching top losers...")
-    _, losers = await get_top_movers(5)
+    market = "futures" if context.args and context.args[0].lower() == "futures" else "spot"
+    _, losers = await get_top_movers(5, market)
     if not losers:
         await update.message.reply_text("❌ Gagal mengambil data. Coba lagi.")
         return
-    msg = "💀 Top 5 Losers (Futures 24h)\n\n"
+    label = "Spot" if market == "spot" else "Futures"
+    msg = f"💀 Top 5 Losers ({label} 24h)\n\n"
     for i, t in enumerate(losers, 1):
         sym = t["symbol"].replace("USDT", "")
         pct = float(t["priceChangePercent"])
@@ -676,6 +823,235 @@ async def top_losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vol = float(t["quoteVolume"])
         msg += f"{i}. {sym}: {pct:.2f}% | ${price:,.4f}\n"
         msg += f"   Vol: ${vol/1e6:.0f}M\n"
+    await update.message.reply_text(msg)
+
+# ─────────────────────────────────────────
+# DEX COMMANDS
+# ─────────────────────────────────────────
+
+async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dex PEPE                    → search by nama
+    /dex solana <contract>       → by contract address + chain
+    /dex <contract>              → auto detect (coba solana dulu)
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Format:\n"
+            "/dex PEPE — cari token by nama\n"
+            "/dex solana <contract> — by contract address\n"
+            "/dex bsc <contract> — BSC chain\n"
+            "/dex ethereum <contract> — ETH chain\n"
+            "/dex base <contract> — Base chain"
+        )
+        return
+
+    await update.message.reply_text("🔍 Mencari token...")
+
+    chains = ["solana", "bsc", "ethereum", "base", "arbitrum", "polygon", "avax"]
+    
+    # cek apakah arg pertama adalah chain name
+    if len(context.args) >= 2 and context.args[0].lower() in chains:
+        chain = context.args[0].lower()
+        address = context.args[1]
+        pairs = await dex_by_contract(chain, address)
+    else:
+        query = " ".join(context.args)
+        # cek apakah ini contract address (panjang > 30 char)
+        if len(context.args[0]) > 30:
+            # coba solana dulu, lalu ETH
+            pairs = await dex_by_contract("solana", context.args[0])
+            if not pairs:
+                pairs = await dex_by_contract("ethereum", context.args[0])
+            if not pairs:
+                pairs = await dex_by_contract("bsc", context.args[0])
+        else:
+            pairs = await dex_search_pairs(query)
+
+    if not pairs:
+        await update.message.reply_text("❌ Token tidak ditemukan di DexScreener.")
+        return
+
+    # Ambil pair terbaik = pair dengan volume tertinggi
+    pairs_sorted = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)
+    best = pairs_sorted[0]
+    
+    await update.message.reply_text(format_dex_pair(best), parse_mode="Markdown")
+
+    # Kalau ada beberapa pair (multi-dex), kasih info
+    if len(pairs_sorted) > 1:
+        other_dexes = list({p.get("dexId", "") for p in pairs_sorted[1:4]})
+        if other_dexes:
+            await update.message.reply_text(
+                f"ℹ️ Token ini juga trading di: {', '.join(other_dexes)}\n"
+                f"Total {len(pairs_sorted)} pair ditemukan."
+            )
+
+async def dexalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dexalert <contract> <mcap_target> [chain]
+    Contoh: /dexalert 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU 1000000
+    """
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Set alert marketcap untuk memecoin!\n\n"
+            "Format: /dexalert <contract> <target_mcap>\n"
+            "Contoh:\n"
+            "/dexalert 7xKXtg...sgAsU 1000000\n"
+            "  → notif kalau mcap sentuh $1jt\n\n"
+            "Optional chain (default: auto-detect):\n"
+            "/dexalert <contract> <mcap> solana"
+        )
+        return
+
+    contract = context.args[0]
+    try:
+        target_mcap = float(context.args[1].replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Target mcap harus angka. Contoh: 1000000 atau 1500000")
+        return
+    
+    chain = context.args[2].lower() if len(context.args) > 2 else "auto"
+
+    await update.message.reply_text("🔍 Checking token...")
+
+    # Cari pair
+    if chain == "auto":
+        pairs = await dex_by_contract("solana", contract)
+        if not pairs:
+            pairs = await dex_by_contract("ethereum", contract)
+        if not pairs:
+            pairs = await dex_by_contract("bsc", contract)
+        detected_chain = pairs[0].get("chainId", "unknown") if pairs else "unknown"
+    else:
+        pairs = await dex_by_contract(chain, contract)
+        detected_chain = chain
+
+    if not pairs:
+        await update.message.reply_text("❌ Token tidak ditemukan. Pastikan contract address benar.")
+        return
+
+    # Ambil pair dengan volume terbesar
+    best = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)[0]
+    base = best.get("baseToken", {})
+    symbol = base.get("symbol", "?")
+    current_mcap = float(best.get("marketCap") or 0)
+
+    if current_mcap == 0:
+        # fallback: fdv
+        current_mcap = float(best.get("fdv") or 0)
+
+    if current_mcap == 0:
+        await update.message.reply_text(
+            f"⚠️ Tidak bisa baca market cap untuk {symbol}.\n"
+            "Mungkin token terlalu baru atau data belum tersedia."
+        )
+        return
+
+    direction = "above" if target_mcap > current_mcap else "below"
+    
+    # Simpan ke Notion: type=dex_mcap_alert, symbol=contract, target=mcap_target, direction=chain|direction
+    direction_str = f"{detected_chain}|{direction}"
+    
+    # cek duplikat
+    existing = await notion_query(user_id, "dex_mcap_alert")
+    for row in existing:
+        r = parse_row(row)
+        if r["symbol"] == contract and r["target"] == str(target_mcap):
+            await update.message.reply_text(f"⚠️ Alert {symbol} mcap ${target_mcap:,.0f} sudah ada!")
+            return
+
+    await notion_add(user_id, "dex_mcap_alert", contract, str(target_mcap), direction_str)
+
+    arrow = "📈" if direction == "above" else "📉"
+    await update.message.reply_text(
+        f"✅ DEX Market Cap Alert set!\n\n"
+        f"🪙 Token  : {symbol}\n"
+        f"⛓ Chain  : {detected_chain.upper()}\n"
+        f"💰 MCap sekarang : ${current_mcap:,.0f}\n"
+        f"{arrow} Target MCap    : ${target_mcap:,.0f}\n"
+        f"📊 Pair address  : {contract[:8]}...{contract[-6:]}"
+    )
+
+async def listdexalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = await notion_query(user_id, "dex_mcap_alert")
+    if not rows:
+        await update.message.reply_text("Tidak ada DEX mcap alert aktif.")
+        return
+    msg = "🔔 DEX Market Cap Alert aktif:\n\n"
+    for row in rows:
+        r = parse_row(row)
+        contract = r["symbol"]
+        target = float(r["target"])
+        parts = r["direction"].split("|")
+        chain = parts[0] if parts else "?"
+        direction = parts[1] if len(parts) > 1 else "?"
+        arrow = "📈" if direction == "above" else "📉"
+        msg += f"{arrow} {contract[:8]}...{contract[-6:]}\n"
+        msg += f"   Chain: {chain.upper()} | Target MCap: ${target:,.0f}\n\n"
+    await update.message.reply_text(msg)
+
+async def removedexalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Format: /removedexalert <contract>")
+        return
+    contract = context.args[0]
+    rows = await notion_query(user_id, "dex_mcap_alert")
+    deleted = 0
+    for row in rows:
+        r = parse_row(row)
+        if r["symbol"] == contract or r["symbol"].startswith(contract[:8]):
+            await notion_delete(r["page_id"])
+            deleted += 1
+    if deleted:
+        await update.message.reply_text(f"✅ {deleted} DEX alert dihapus.")
+    else:
+        await update.message.reply_text("❌ Alert tidak ditemukan.")
+
+async def dextrending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 Fetching DEX trending...")
+    tokens = await dex_trending_tokens()
+    if not tokens:
+        await update.message.reply_text("❌ Gagal mengambil data trending.")
+        return
+    msg = "🔥 DEX Trending (Most Boosted)\n\n"
+    for i, t in enumerate(tokens[:10], 1):
+        chain = t.get("chainId", "?").upper()
+        addr = t.get("tokenAddress", "")
+        short_addr = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
+        desc = t.get("description", "")[:40] if t.get("description") else ""
+        amount = t.get("totalAmount", 0)
+        url = t.get("url", "")
+        msg += f"{i}. [{chain}] {short_addr}\n"
+        if desc:
+            msg += f"   {desc}\n"
+        msg += f"   💎 Boost: {amount}\n"
+        if url:
+            msg += f"   🔗 {url}\n"
+        msg += "\n"
+    await update.message.reply_text(msg)
+
+async def dexnew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🆕 Fetching new listings...")
+    tokens = await dex_new_listings()
+    if not tokens:
+        await update.message.reply_text("❌ Gagal mengambil data new listings.")
+        return
+    msg = "🆕 Token Baru di DexScreener\n\n"
+    for i, t in enumerate(tokens[:10], 1):
+        chain = t.get("chainId", "?").upper()
+        addr = t.get("tokenAddress", "")
+        short_addr = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
+        desc = t.get("description", "")[:50] if t.get("description") else "—"
+        url = t.get("url", "")
+        msg += f"{i}. [{chain}] {short_addr}\n"
+        msg += f"   {desc}\n"
+        if url:
+            msg += f"   🔗 {url}\n"
+        msg += "\n"
     await update.message.reply_text(msg)
 
 # ─────────────────────────────────────────
@@ -755,6 +1131,42 @@ async def check_oi_spikes(context: ContextTypes.DEFAULT_TYPE):
                         )
         oi_cache[symbol] = oi
 
+async def check_dex_mcap_alerts(context: ContextTypes.DEFAULT_TYPE):
+    rows = await notion_query_all("dex_mcap_alert")
+    for row in rows:
+        r = parse_row(row)
+        contract = r["symbol"]
+        target_mcap = float(r["target"])
+        parts = r["direction"].split("|")
+        chain = parts[0] if parts else "solana"
+        direction = parts[1] if len(parts) > 1 else "above"
+
+        pairs = await dex_by_contract(chain, contract)
+        if not pairs:
+            continue
+
+        best = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)[0]
+        base = best.get("baseToken", {})
+        symbol = base.get("symbol", contract[:8])
+        current_mcap = float(best.get("marketCap") or best.get("fdv") or 0)
+
+        if current_mcap == 0:
+            continue
+
+        hit = (direction == "above" and current_mcap >= target_mcap) or               (direction == "below" and current_mcap <= target_mcap)
+
+        if hit:
+            await notion_delete(r["page_id"])
+            arrow = "📈" if direction == "above" else "📉"
+            await context.bot.send_message(
+                chat_id=r["user_id"],
+                text=f"🚨 DEX MCAP ALERT KENA!\n\n"
+                     f"{arrow} {symbol} marketcap sentuh ${target_mcap:,.0f}\n"
+                     f"💰 MCap sekarang: ${current_mcap:,.0f}\n"
+                     f"⛓ Chain: {chain.upper()}\n"
+                     f"🔗 {best.get('url', '')}"
+            )
+
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
@@ -787,9 +1199,17 @@ def main():
     app.add_handler(CommandHandler("dominance", dominance_cmd))
     app.add_handler(CommandHandler("heatmap", heatmap_cmd))
 
+    app.add_handler(CommandHandler("dex", dex_cmd))
+    app.add_handler(CommandHandler("dexalert", dexalert_cmd))
+    app.add_handler(CommandHandler("listdexalerts", listdexalerts_cmd))
+    app.add_handler(CommandHandler("removedexalert", removedexalert_cmd))
+    app.add_handler(CommandHandler("dextrending", dextrending_cmd))
+    app.add_handler(CommandHandler("dexnew", dexnew_cmd))
+
     app.job_queue.run_repeating(check_price_alerts, interval=60, first=10)
     app.job_queue.run_repeating(check_funding_spikes, interval=3600, first=30)
     app.job_queue.run_repeating(check_oi_spikes, interval=3600, first=30)
+    app.job_queue.run_repeating(check_dex_mcap_alerts, interval=300, first=20)
 
     print("Bot running...")
     app.run_polling()
