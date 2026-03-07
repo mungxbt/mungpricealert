@@ -405,9 +405,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚖️ LONG/SHORT RATIO\n"
         "/lsr BTC — cek L/S ratio\n\n"
         "🏆 TOP MOVERS\n"
-        "/topgainers — top 5 naik 24h (spot)\n"
-        "/topgainers futures — versi futures\n"
-        "/toplosers — top 5 turun 24h (spot)\n\n"
+        "/topgainers — top 5 coin naik 24h\n"
+        "/toplosers — top 5 coin turun 24h\n\n"
         "😱 MARKET SENTIMENT\n"
         "/feargreed — Fear & Greed Index\n"
         "/dominance — BTC & ETH dominance\n"
@@ -790,14 +789,11 @@ async def heatmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Fetching top gainers...")
-    # default spot (sama dengan web Binance), bisa tambah 'futures' sbg arg
-    market = "futures" if context.args and context.args[0].lower() == "futures" else "spot"
-    gainers, _ = await get_top_movers(5, market)
+    gainers, _ = await get_top_movers(5, "spot")
     if not gainers:
         await update.message.reply_text("❌ Gagal mengambil data. Coba lagi.")
         return
-    label = "Spot" if market == "spot" else "Futures"
-    msg = f"🏆 Top 5 Gainers ({label} 24h)\n\n"
+    msg = "🏆 Top 5 Gainers (Spot 24h)\n\n"
     for i, t in enumerate(gainers, 1):
         sym = t["symbol"].replace("USDT", "")
         pct = float(t["priceChangePercent"])
@@ -809,13 +805,11 @@ async def top_gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Fetching top losers...")
-    market = "futures" if context.args and context.args[0].lower() == "futures" else "spot"
-    _, losers = await get_top_movers(5, market)
+    _, losers = await get_top_movers(5, "spot")
     if not losers:
         await update.message.reply_text("❌ Gagal mengambil data. Coba lagi.")
         return
-    label = "Spot" if market == "spot" else "Futures"
-    msg = f"💀 Top 5 Losers ({label} 24h)\n\n"
+    msg = "💀 Top 5 Losers (Spot 24h)\n\n"
     for i, t in enumerate(losers, 1):
         sym = t["symbol"].replace("USDT", "")
         pct = float(t["priceChangePercent"])
@@ -831,14 +825,14 @@ async def top_losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /dex PEPE                    → search by nama
+    /dex PEPE                    → search by nama/ticker
     /dex solana <contract>       → by contract address + chain
-    /dex <contract>              → auto detect (coba solana dulu)
+    /dex <contract>              → auto detect chain
     """
     if not context.args:
         await update.message.reply_text(
             "Format:\n"
-            "/dex PEPE — cari token by nama\n"
+            "/dex PEPE — cari by nama atau ticker\n"
             "/dex solana <contract> — by contract address\n"
             "/dex bsc <contract> — BSC chain\n"
             "/dex ethereum <contract> — ETH chain\n"
@@ -849,36 +843,59 @@ async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Mencari token...")
 
     chains = ["solana", "bsc", "ethereum", "base", "arbitrum", "polygon", "avax"]
-    
+
     # cek apakah arg pertama adalah chain name
     if len(context.args) >= 2 and context.args[0].lower() in chains:
         chain = context.args[0].lower()
         address = context.args[1]
         pairs = await dex_by_contract(chain, address)
+    elif len(context.args[0]) > 30:
+        # contract address - auto detect chain
+        pairs = await dex_by_contract("solana", context.args[0])
+        if not pairs:
+            pairs = await dex_by_contract("ethereum", context.args[0])
+        if not pairs:
+            pairs = await dex_by_contract("bsc", context.args[0])
     else:
+        # Search by nama/ticker - coba dua query sekaligus:
+        # 1. query asli (biasanya nama lengkap)
+        # 2. query versi uppercase (ticker)
         query = " ".join(context.args)
-        # cek apakah ini contract address (panjang > 30 char)
-        if len(context.args[0]) > 30:
-            # coba solana dulu, lalu ETH
-            pairs = await dex_by_contract("solana", context.args[0])
-            if not pairs:
-                pairs = await dex_by_contract("ethereum", context.args[0])
-            if not pairs:
-                pairs = await dex_by_contract("bsc", context.args[0])
-        else:
-            pairs = await dex_search_pairs(query)
+        pairs = await dex_search_pairs(query)
+
+        # Filter: prioritaskan yang symbol/name-nya exact match dulu
+        query_upper = query.upper()
+        exact = [
+            p for p in pairs
+            if p.get("baseToken", {}).get("symbol", "").upper() == query_upper
+            or p.get("baseToken", {}).get("name", "").upper() == query.upper()
+        ]
+
+        if exact:
+            # ada exact match → pakai itu, sort by volume
+            pairs = exact
+        elif pairs:
+            # tidak ada exact match → pakai semua hasil, sort by volume
+            # filter: buang pair yang symbolnya terlalu beda (hindari false positive)
+            # hanya ambil yang symbol atau nama mengandung query
+            filtered = [
+                p for p in pairs
+                if query_upper in p.get("baseToken", {}).get("symbol", "").upper()
+                or query.lower() in p.get("baseToken", {}).get("name", "").lower()
+            ]
+            pairs = filtered if filtered else pairs
 
     if not pairs:
         await update.message.reply_text("❌ Token tidak ditemukan di DexScreener.")
         return
 
-    # Ambil pair terbaik = pair dengan volume tertinggi
+    # Ambil pair terbaik = volume tertinggi
     pairs_sorted = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)
     best = pairs_sorted[0]
-    
+
     await update.message.reply_text(format_dex_pair(best), parse_mode="Markdown")
 
-    # Kalau ada beberapa pair (multi-dex), kasih info
+    # Kalau ada beberapa pair (multi-dex), kasih info singkat
     if len(pairs_sorted) > 1:
         other_dexes = list({p.get("dexId", "") for p in pairs_sorted[1:4]})
         if other_dexes:
