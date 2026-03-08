@@ -1655,7 +1655,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📉 Total PnL   : {total_pnl:+.2f}%\n\n"
             f"📋 Detail:\n"
         )
-        for c in sorted(calls, key=lambda x: x["pnl_pct"], reverse=True):
+        for c in calls:
             emoji = "✅" if c["result"] == "tp_hit" else "❌"
             direction = "📈" if c["call_type"] == "buy" else "📉"
             msg += f"   {emoji} {c['symbol']} {direction} {c['pnl_pct']:+.2f}%\n"
@@ -1683,14 +1683,13 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📉 Total PnL   : {total_pnl:+.2f}%\n\n"
             f"👥 Per Trader:\n"
         )
-        for uname, s in sorted(user_stats.items(), key=lambda x: sum(c["pnl_pct"] for c in calls if c["username"] == x[0]), reverse=True):
+        for uname, s in sorted(user_stats.items(), key=lambda x: x[1]["win"], reverse=True):
             total_u = s["win"] + s["loss"]
             wr_u = s["win"] / total_u * 100 if total_u > 0 else 0
-            roi_u = sum(c["pnl_pct"] for c in calls if c["username"] == uname)
-            msg += f"   @{uname}: {s['win']}W/{s['loss']}L ({wr_u:.0f}%) ROI: {roi_u:+.2f}%\n"
+            msg += f"   @{uname}: {s['win']}W/{s['loss']}L ({wr_u:.0f}%)\n"
 
         msg += f"\n📋 Detail:\n"
-        for c in sorted(calls, key=lambda x: x["pnl_pct"], reverse=True):
+        for c in calls:
             emoji = "✅" if c["result"] == "tp_hit" else "❌"
             direction = "📈" if c["call_type"] == "buy" else "📉"
             msg += f"   {emoji} @{c['username']} {c['symbol']} {direction} {c['pnl_pct']:+.2f}%\n"
