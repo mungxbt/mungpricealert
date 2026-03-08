@@ -1845,6 +1845,34 @@ async def check_dex_mcap_alerts(context: ContextTypes.DEFAULT_TYPE):
                          f"🔗 {best.get('url', '')}"
                 )
 
+async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
+    rows = await notion_query_all("price_alert")
+    for row in rows:
+        r = parse_row(row)
+        price = await get_price(r["symbol"])
+        if price is None:
+            continue
+        target = float(r["target"])
+        hit = (r["direction"] == "above" and price >= target) or \
+              (r["direction"] == "below" and price <= target)
+        if hit:
+            await notion_delete(r["page_id"])
+            arrow = "📈" if r["direction"] == "above" else "📉"
+            try:
+                await context.bot.send_message(
+                    chat_id=r["chat_id"],
+                    text=f"🚨 PRICE ALERT KENA!\n\n"
+                         f"{arrow} {r['symbol']} sudah sentuh ${target:,.6f}\n"
+                         f"💰 Harga sekarang: ${price:,.6f}"
+                )
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=r["user_id"],
+                    text=f"🚨 PRICE ALERT KENA!\n\n"
+                         f"{arrow} {r['symbol']} sudah sentuh ${target:,.6f}\n"
+                         f"💰 Harga sekarang: ${price:,.6f}"
+                )
+
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
