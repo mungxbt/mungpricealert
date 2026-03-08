@@ -346,60 +346,7 @@ def pct_emoji(v) -> str:
     except:
         return "⚪"
 
-def extract_twitter_from_pair(pair: dict) -> str | None:
-    """Coba ambil Twitter dari field info pair (kalau ada)"""
-    info = pair.get("info") or {}
-    socials = info.get("socials") or []
-    for s in socials:
-        stype = (s.get("type") or "").lower()
-        url = s.get("url") or ""
-        if stype in ("twitter", "x") or "twitter.com" in url or "x.com" in url:
-            username = url.rstrip("/").split("/")[-1]
-            if username and username not in ("twitter.com", "x.com", "i", "home"):
-                return username
-    return None
 
-async def fetch_twitter_from_profile(chain: str, address: str) -> str | None:
-    """Ambil Twitter dari token-profiles endpoint (lebih lengkap)"""
-    url = f"https://api.dexscreener.com/token-profiles/latest/v1"
-    # token-profiles tidak support query by address langsung,
-    # tapi kita bisa cek di token-boosts endpoint yang support by address
-    url2 = f"https://api.dexscreener.com/token-boosts/latest/v1"
-    
-    # Coba dari orders endpoint yang punya links
-    orders_url = f"https://api.dexscreener.com/orders/v1/{chain}/{address}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Cek di token-pairs dengan chain/address — kadang ada di sini
-            pairs_url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
-            async with session.get(pairs_url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pairs = data if isinstance(data, list) else data.get("pairs", [])
-                    for p in (pairs or []):
-                        twitter = extract_twitter_from_pair(p)
-                        if twitter:
-                            return twitter
-    except Exception:
-        pass
-    return None
-
-async def extract_twitter(pair: dict) -> str | None:
-    """Ambil Twitter: coba dari pair dulu, kalau gak ada fetch dari profile"""
-    # 1. Coba dari data pair yang sudah ada
-    twitter = extract_twitter_from_pair(pair)
-    if twitter:
-        return twitter
-    
-    # 2. Coba fetch ulang dengan token-pairs endpoint yang lebih lengkap
-    chain = pair.get("chainId", "")
-    address = pair.get("baseToken", {}).get("address", "")
-    if chain and address:
-        twitter = await fetch_twitter_from_profile(chain, address)
-        if twitter:
-            return twitter
-    
-    return None
 
 def format_dex_pair(pair: dict) -> str:
     base = pair.get("baseToken", {})
@@ -439,18 +386,6 @@ def format_dex_pair(pair: dict) -> str:
     msg += f"🔄 Txns 24h  : {buys} buy / {sells} sell\n"
     if pair_url:
         msg += f"\n🔗 {pair_url}"
-    return msg
-
-def format_dex_pair_with_twitter(pair: dict, twitter: str | None) -> str:
-    """Sama seperti format_dex_pair tapi include Twitter/Rick link"""
-    msg = format_dex_pair(pair)
-    if twitter:
-        # sisipkan sebelum link DexScreener
-        rick_line = f"\n🐦 Twitter : @{twitter}\n🕵️ Cek Rick: t.me/RickBurpBot?start=twit_{twitter}"
-        if "\n🔗" in msg:
-            msg = msg.replace("\n🔗", rick_line + "\n🔗")
-        else:
-            msg += rick_line
     return msg
 
 def funding_status(rate: float) -> str:
@@ -983,9 +918,7 @@ async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pairs_sorted = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)
     best = pairs_sorted[0]
 
-    # Cari Twitter — async
-    twitter = await extract_twitter(best)
-    await update.message.reply_text(format_dex_pair_with_twitter(best, twitter), parse_mode="Markdown")
+    await update.message.reply_text(format_dex_pair(best), parse_mode="Markdown")
 
     # Kalau ada beberapa pair (multi-dex), kasih info singkat
     if len(pairs_sorted) > 1:
