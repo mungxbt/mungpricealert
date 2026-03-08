@@ -5,6 +5,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = "e756c4cf39eb48caa461a3faca6f8ab0"
+NOTION_HISTORY_DB_ID = "47f287ad128844b0b4911c6e6f983b16"
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Content-Type": "application/json",
@@ -447,6 +448,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mycalls — lihat call aktif lo\n"
         "/allcalls — semua call aktif di grup\n"
         "/removecall BTC — hapus call\n"
+        "/stats — statistik global bulan ini\n"
+        "/stats me — statistik lo sendiri bulan ini\n"
+        "/stats 2025-03 — statistik global bulan tertentu\n"
+        "/stats me 2025-03 — statistik lo bulan tertentu\n"
     )
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1209,6 +1214,52 @@ def parse_call(row: dict) -> dict | None:
     except Exception:
         return None
 
+async def notion_save_call_history(c: dict, result: str, pnl_pct: float):
+    """Simpan call yang sudah closed ke history database."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    month = now.strftime("%Y-%m")
+    closed_date = now.strftime("%Y-%m-%d")
+    name = f"{result}:{c['symbol']}:{c['call_type']}:{closed_date}"
+    payload = {
+        "parent": {"database_id": "47f287ad128844b0b4911c6e6f983b16"},
+        "properties": {
+            "Name": {"title": [{"text": {"content": name}}]},
+            "user_id": {"rich_text": [{"text": {"content": str(c["user_id"])}}]},
+            "username": {"rich_text": [{"text": {"content": c["username"]}}]},
+            "chat_id": {"rich_text": [{"text": {"content": str(c["chat_id"])}}]},
+            "symbol": {"rich_text": [{"text": {"content": c["symbol"]}}]},
+            "call_type": {"select": {"name": c.get("call_type", "buy")}},
+            "entry": {"rich_text": [{"text": {"content": str(c["entry"])}}]},
+            "tp": {"rich_text": [{"text": {"content": str(c["tp"])}}]},
+            "sl": {"rich_text": [{"text": {"content": str(c["sl"])}}]},
+            "result": {"select": {"name": result}},
+            "pnl_pct": {"rich_text": [{"text": {"content": f"{pnl_pct:.2f}"}}]},
+            "closed_date": {"date": {"start": closed_date}},
+            "month": {"rich_text": [{"text": {"content": month}}]},
+        }
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload) as resp:
+            return await resp.json()
+
+async def notion_query_history_by_month(month: str) -> list:
+    """Query call history berdasarkan bulan (format: YYYY-MM)."""
+    payload = {
+        "filter": {
+            "property": "month",
+            "rich_text": {"equals": month}
+        },
+        "page_size": 100
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://api.notion.com/v1/databases/47f287ad128844b0b4911c6e6f983b16/query",
+            headers=NOTION_HEADERS, json=payload
+        ) as resp:
+            data = await resp.json()
+            return data.get("results", [])
+
 # ─────────────────────────────────────────
 # CALL TRACKER COMMANDS
 # ─────────────────────────────────────────
@@ -1498,10 +1549,8 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
             sl_hit = (is_long and price <= c["sl"]) or (not is_long and price >= c["sl"])
 
             if tp_hit:
-                await notion_update_call_status(c["page_id"], "tp_hit", {
-                    "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
-                    "username": c["username"], "chat_id": c["chat_id"]
-                })
+                await notion_save_call_history(c, "tp_hit", tp_pct)
+                await notion_delete(c["page_id"])
                 await notify(
                     f"🚀 TP HIT! PROFIT!\n\n"
                     f"📣 Call @{c['username']}\n"
@@ -1512,10 +1561,8 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Profit: {tp_pct:+.2f}%"
                 )
             elif sl_hit:
-                await notion_update_call_status(c["page_id"], "sl_hit", {
-                    "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
-                    "username": c["username"], "chat_id": c["chat_id"]
-                })
+                await notion_save_call_history(c, "sl_hit", -abs(sl_pct))
+                await notion_delete(c["page_id"])
                 await notify(
                     f"🔴 SL HIT! STOP LOSS!\n\n"
                     f"📣 Call @{c['username']}\n"
@@ -1526,7 +1573,131 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
                     f"❌ Loss: {sl_pct:+.2f}%"
                 )
 
-async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats, /stats me, /stats 2025-03, /stats me 2025-03"""
+    from datetime import datetime, timezone
+
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name or str(user_id)
+
+    # Parse args: bisa "me", "2025-03", atau "me 2025-03"
+    args = [a.lower() for a in context.args]
+    personal = "me" in args
+    month_args = [a for a in args if a != "me"]
+
+    if month_args:
+        month = month_args[0]
+        try:
+            datetime.strptime(month, "%Y-%m")
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Format bulan salah.\n"
+                "Contoh: /stats | /stats me | /stats 2025-03 | /stats me 2025-03"
+            )
+            return
+    else:
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    rows = await notion_query_history_by_month(month)
+
+    # Filter per user kalau /stats me
+    if personal:
+        rows = [r for r in rows if r["properties"].get("user_id", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "") == str(user_id)]
+
+    if not rows:
+        month_label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+        if personal:
+            await update.message.reply_text(f"📊 Lo belum ada call yang closed di bulan {month_label}.")
+        else:
+            await update.message.reply_text(f"📊 Belum ada call yang closed di bulan {month_label}.")
+        return
+
+    # Parse semua rows
+    calls = []
+    for row in rows:
+        props = row["properties"]
+        def txt(k):
+            items = props.get(k, {}).get("rich_text", [])
+            return items[0]["text"]["content"] if items else ""
+        def sel(k):
+            s = props.get(k, {}).get("select")
+            return s["name"] if s else ""
+        calls.append({
+            "username": txt("username"),
+            "symbol": txt("symbol"),
+            "call_type": sel("call_type"),
+            "result": sel("result"),
+            "pnl_pct": float(txt("pnl_pct") or "0"),
+        })
+
+    total = len(calls)
+    wins = [c for c in calls if c["result"] == "tp_hit"]
+    losses = [c for c in calls if c["result"] == "sl_hit"]
+    win_rate = (len(wins) / total * 100) if total > 0 else 0
+    avg_profit = sum(c["pnl_pct"] for c in wins) / len(wins) if wins else 0
+    avg_loss = sum(c["pnl_pct"] for c in losses) / len(losses) if losses else 0
+    total_pnl = sum(c["pnl_pct"] for c in calls)
+
+    month_name = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+
+    if personal:
+        # Mode personal — no per-trader breakdown
+        msg = (
+            f"📊 STATISTIK LO — {month_name}\n"
+            f"👤 @{username}\n"
+            f"{'─' * 28}\n\n"
+            f"📈 Total Call  : {total}\n"
+            f"✅ TP Hit      : {len(wins)}\n"
+            f"❌ SL Hit      : {len(losses)}\n"
+            f"🎯 Win Rate    : {win_rate:.1f}%\n\n"
+            f"💰 Avg Profit  : {avg_profit:+.2f}%\n"
+            f"🩸 Avg Loss    : {avg_loss:+.2f}%\n"
+            f"📉 Total PnL   : {total_pnl:+.2f}%\n\n"
+            f"📋 Detail:\n"
+        )
+        for c in sorted(calls, key=lambda x: x["pnl_pct"], reverse=True):
+            emoji = "✅" if c["result"] == "tp_hit" else "❌"
+            direction = "📈" if c["call_type"] == "buy" else "📉"
+            msg += f"   {emoji} {c['symbol']} {direction} {c['pnl_pct']:+.2f}%\n"
+    else:
+        # Mode global — tampilkan per trader breakdown
+        user_stats = {}
+        for c in calls:
+            u = c["username"]
+            if u not in user_stats:
+                user_stats[u] = {"win": 0, "loss": 0}
+            if c["result"] == "tp_hit":
+                user_stats[u]["win"] += 1
+            else:
+                user_stats[u]["loss"] += 1
+
+        msg = (
+            f"📊 STATISTIK GLOBAL — {month_name}\n"
+            f"{'─' * 28}\n\n"
+            f"📈 Total Call  : {total}\n"
+            f"✅ TP Hit      : {len(wins)}\n"
+            f"❌ SL Hit      : {len(losses)}\n"
+            f"🎯 Win Rate    : {win_rate:.1f}%\n\n"
+            f"💰 Avg Profit  : {avg_profit:+.2f}%\n"
+            f"🩸 Avg Loss    : {avg_loss:+.2f}%\n"
+            f"📉 Total PnL   : {total_pnl:+.2f}%\n\n"
+            f"👥 Per Trader:\n"
+        )
+        for uname, s in sorted(user_stats.items(), key=lambda x: sum(c["pnl_pct"] for c in calls if c["username"] == x[0]), reverse=True):
+            total_u = s["win"] + s["loss"]
+            wr_u = s["win"] / total_u * 100 if total_u > 0 else 0
+            roi_u = sum(c["pnl_pct"] for c in calls if c["username"] == uname)
+            msg += f"   @{uname}: {s['win']}W/{s['loss']}L ({wr_u:.0f}%) ROI: {roi_u:+.2f}%\n"
+
+        msg += f"\n📋 Detail:\n"
+        for c in sorted(calls, key=lambda x: x["pnl_pct"], reverse=True):
+            emoji = "✅" if c["result"] == "tp_hit" else "❌"
+            direction = "📈" if c["call_type"] == "buy" else "📉"
+            msg += f"   {emoji} @{c['username']} {c['symbol']} {direction} {c['pnl_pct']:+.2f}%\n"
+
+    await update.message.reply_text(msg)
+
+
     rows = await notion_query_all("price_alert")
     for row in rows:
         r = parse_row(row)
@@ -1715,6 +1886,7 @@ def main():
     app.add_handler(CommandHandler("mycalls", mycalls_cmd))
     app.add_handler(CommandHandler("allcalls", allcalls_cmd))
     app.add_handler(CommandHandler("removecall", removecall_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
 
     app.job_queue.run_repeating(check_price_alerts, interval=60, first=10)
     app.job_queue.run_repeating(check_funding_spikes, interval=3600, first=30)
