@@ -440,7 +440,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/listdexalerts — lihat dex alert\n"
         "/removedexalert <contract> — hapus alert\n"
         "/dextrending — token paling banyak di-boost\n"
-        "/dexnew — token baru listing\n"
+        "/dexnew — token baru listing\n\n"
+        "📣 CALL TRACKER\n"
+        "/buy BTC 75000 TP 80000 SL 73000 — long/buy call\n"
+        "/sell BTC 75000 TP 70000 SL 78000 — short/sell call\n"
+        "/mycalls — lihat call aktif lo\n"
+        "/allcalls — semua call aktif di grup\n"
+        "/removecall BTC — hapus call\n"
     )
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1135,11 +1141,347 @@ async def dexnew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\n"
     await update.message.reply_text(msg)
 
+async def notion_add_call(user_id: int, symbol: str, entry: float, tp: float, sl: float,
+                          username: str, chat_id: int, status: str = "waiting", call_type: str = "buy"):
+    """Simpan call tracker ke Notion."""
+    import json
+    name = f"call:{user_id}:{symbol}:{call_type}"
+    data = json.dumps({
+        "entry": entry, "tp": tp, "sl": sl,
+        "username": username, "chat_id": chat_id,
+        "status": status, "call_type": call_type
+    })
+    payload = {
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": {
+            "Name": {"title": [{"text": {"content": name}}]},
+            "user_id": {"rich_text": [{"text": {"content": str(user_id)}}]},
+            "type": {"select": {"name": "call_tracker"}},
+            "symbol": {"rich_text": [{"text": {"content": symbol}}]},
+            "target": {"rich_text": [{"text": {"content": data}}]},
+            "direction": {"rich_text": [{"text": {"content": call_type}}]},
+            "active": {"checkbox": True}
+        }
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload) as resp:
+            return await resp.json()
+
+async def notion_update_call_status(page_id: str, status: str, data: dict):
+    """Update status call (waiting → active → closed)."""
+    import json
+    data["status"] = status
+    async with aiohttp.ClientSession() as session:
+        async with session.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={
+                "properties": {
+                    "direction": {"rich_text": [{"text": {"content": status}}]},
+                    "target": {"rich_text": [{"text": {"content": json.dumps(data)}}]},
+                    "active": {"checkbox": status not in ("tp_hit", "sl_hit")}
+                }
+            }
+        ) as resp:
+            return await resp.json()
+
+def parse_call(row: dict) -> dict | None:
+    """Parse call tracker row dari Notion."""
+    import json
+    props = row["properties"]
+    def txt(key):
+        items = props.get(key, {}).get("rich_text", [])
+        return items[0]["text"]["content"] if items else ""
+    try:
+        data = json.loads(txt("target"))
+        return {
+            "page_id": row["id"],
+            "user_id": int(txt("user_id")),
+            "symbol": txt("symbol"),
+            "entry": float(data["entry"]),
+            "tp": float(data["tp"]),
+            "sl": float(data["sl"]),
+            "username": data.get("username", "unknown"),
+            "chat_id": int(data.get("chat_id", data.get("user_id", 0))),
+            "status": data.get("status", "waiting"),
+            "call_type": data.get("call_type", "buy"),
+        }
+    except Exception:
+        return None
+
+# ─────────────────────────────────────────
+# CALL TRACKER COMMANDS
+# ─────────────────────────────────────────
+
+async def _process_call(update: Update, context, call_type: str):
+    """Shared logic untuk /buy dan /sell."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or update.effective_user.first_name or str(user_id)
+    is_long = (call_type == "buy")
+
+    if len(context.args) < 6:
+        if is_long:
+            await update.message.reply_text(
+                "📈 Format buy/long call:\n"
+                "/buy BTC 75000 TP 80000 SL 73000\n\n"
+                "TP harus di ATAS entry, SL harus di BAWAH entry."
+            )
+        else:
+            await update.message.reply_text(
+                "📉 Format sell/short call:\n"
+                "/sell BTC 75000 TP 70000 SL 78000\n\n"
+                "TP harus di BAWAH entry, SL harus di ATAS entry."
+            )
+        return
+
+    symbol = context.args[0].upper()
+    try:
+        entry = float(context.args[1])
+        if context.args[2].upper() != "TP" or context.args[4].upper() != "SL":
+            raise ValueError
+        tp = float(context.args[3])
+        sl = float(context.args[5])
+    except (ValueError, IndexError):
+        cmd = "buy" if is_long else "sell"
+        await update.message.reply_text(f"❌ Format salah.\nContoh: /{cmd} BTC 75000 TP 80000 SL 73000")
+        return
+
+    # Validasi arah sesuai tipe call
+    if is_long:
+        if tp <= entry:
+            await update.message.reply_text("❌ Untuk LONG/BUY, TP harus di atas entry.")
+            return
+        if sl >= entry:
+            await update.message.reply_text("❌ Untuk LONG/BUY, SL harus di bawah entry.")
+            return
+    else:
+        if tp >= entry:
+            await update.message.reply_text("❌ Untuk SHORT/SELL, TP harus di bawah entry.")
+            return
+        if sl <= entry:
+            await update.message.reply_text("❌ Untuk SHORT/SELL, SL harus di atas entry.")
+            return
+
+    current = await get_price(symbol)
+    if current is None:
+        await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Binance.")
+        return
+
+    # Hapus call lama user untuk coin + tipe yang sama
+    existing = await notion_query(user_id, "call_tracker")
+    for row in existing:
+        c = parse_call(row)
+        if c and c["symbol"] == symbol and c.get("call_type", "buy") == call_type:
+            await notion_delete(c["page_id"])
+
+    tp_pct = ((tp - entry) / entry) * 100
+    sl_pct = ((sl - entry) / entry) * 100
+    rr = abs(tp_pct / sl_pct) if sl_pct != 0 else 0
+
+    # Status awal
+    if is_long:
+        status = "active" if current >= entry else "waiting"
+    else:
+        status = "active" if current <= entry else "waiting"
+
+    await notion_add_call(user_id, symbol, entry, tp, sl, username, chat_id, status, call_type=call_type)
+
+    direction_label = "LONG 📈" if is_long else "SHORT 📉"
+    status_label = "✅ ACTIVE — harga sudah di entry!" if status == "active" else "⏳ WAITING — menunggu harga sentuh entry"
+
+    await update.message.reply_text(
+        f"📣 {'BUY' if is_long else 'SELL'} CALL — {direction_label}\n"
+        f"👤 @{username}\n\n"
+        f"🪙 Coin   : {symbol}\n"
+        f"🎯 Entry  : ${entry:,.4f}\n"
+        f"🟢 TP     : ${tp:,.4f} ({tp_pct:+.2f}%)\n"
+        f"🔴 SL     : ${sl:,.4f} ({sl_pct:+.2f}%)\n"
+        f"⚖️ R/R    : 1:{rr:.2f}\n\n"
+        f"💰 Harga skrg: ${current:,.4f}\n"
+        f"📊 Status: {status_label}"
+    )
+
+async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/buy BTC 75000 TP 80000 SL 73000 — Long/Spot buy call"""
+    await _process_call(update, context, "buy")
+
+async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sell BTC 75000 TP 70000 SL 78000 — Short/Sell call"""
+    await _process_call(update, context, "sell")
+
+async def mycalls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lihat semua call aktif milik user."""
+    user_id = update.effective_user.id
+    rows = await notion_query(user_id, "call_tracker")
+    if not rows:
+        await update.message.reply_text("Tidak ada call aktif.")
+        return
+
+    msg = "📣 Call aktif lo:\n\n"
+    for row in rows:
+        c = parse_call(row)
+        if not c:
+            continue
+        is_long = c["tp"] > c["entry"]
+        direction = "LONG 📈" if is_long else "SHORT 📉"
+        tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
+        sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+        price = await get_price(c["symbol"])
+        current_pnl = ""
+        if price and c["status"] == "active":
+            pnl = ((price - c["entry"]) / c["entry"]) * 100
+            if not is_long:
+                pnl = -pnl
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            current_pnl = f"\n{pnl_emoji} PnL skrg: {pnl:+.2f}%"
+
+        status_map = {"waiting": "⏳ Waiting", "active": "✅ Active"}
+        status_label = status_map.get(c["status"], c["status"])
+
+        msg += (
+            f"🪙 {c['symbol']} — {direction}\n"
+            f"   Entry: ${c['entry']:,.4f} | TP: ${c['tp']:,.4f} ({tp_pct:+.2f}%) | SL: ${c['sl']:,.4f} ({sl_pct:+.2f}%)\n"
+            f"   Status: {status_label}{current_pnl}\n\n"
+        )
+    await update.message.reply_text(msg)
+
+async def removecall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hapus call aktif. /removecall BTC atau /removecall BTC sell"""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Format:\n"
+            "/removecall BTC — hapus semua call BTC\n"
+            "/removecall BTC buy — hapus call buy BTC\n"
+            "/removecall BTC sell — hapus call sell BTC"
+        )
+        return
+    symbol = context.args[0].upper()
+    call_type_filter = context.args[1].lower() if len(context.args) > 1 else None
+    rows = await notion_query(user_id, "call_tracker")
+    deleted = 0
+    for row in rows:
+        c = parse_call(row)
+        if not c or c["symbol"] != symbol:
+            continue
+        if call_type_filter and c.get("call_type", "buy") != call_type_filter:
+            continue
+        await notion_delete(c["page_id"])
+        deleted += 1
+    if deleted:
+        await update.message.reply_text(f"✅ {deleted} call {symbol} dihapus.")
+    else:
+        await update.message.reply_text(f"❌ Tidak ada call aktif untuk {symbol}.")
+
+async def allcalls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lihat semua call aktif di chat ini (dari semua user)."""
+    rows = await notion_query_all("call_tracker")
+    chat_id = update.effective_chat.id
+
+    # Filter berdasarkan chat_id
+    chat_calls = []
+    for row in rows:
+        c = parse_call(row)
+        if c and c["chat_id"] == chat_id:
+            chat_calls.append(c)
+
+    if not chat_calls:
+        await update.message.reply_text("Tidak ada call aktif di grup ini.")
+        return
+
+    msg = "📣 Semua call aktif di sini:\n\n"
+    for c in chat_calls:
+        is_long = c["tp"] > c["entry"]
+        direction = "LONG 📈" if is_long else "SHORT 📉"
+        tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
+        sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+        status_map = {"waiting": "⏳", "active": "✅"}
+        status_label = status_map.get(c["status"], "?")
+        msg += (
+            f"{status_label} @{c['username']} — {c['symbol']} {direction}\n"
+            f"   Entry: ${c['entry']:,.4f} | TP: {tp_pct:+.2f}% | SL: {sl_pct:+.2f}%\n\n"
+        )
+    await update.message.reply_text(msg)
+
 # ─────────────────────────────────────────
 # BACKGROUND JOBS
 # ─────────────────────────────────────────
 
-async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
+async def check_calls(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor call tracker — cek entry hit, TP hit, SL hit."""
+    rows = await notion_query_all("call_tracker")
+    for row in rows:
+        c = parse_call(row)
+        if not c:
+            continue
+
+        price = await get_price(c["symbol"])
+        if price is None:
+            continue
+
+        is_long = c["tp"] > c["entry"]
+        tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
+        sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+
+        async def notify(text, _c=c):
+            try:
+                await context.bot.send_message(chat_id=_c["chat_id"], text=text)
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=_c["user_id"], text=text)
+                except Exception:
+                    pass
+
+        if c["status"] == "waiting":
+            entry_hit = (is_long and price >= c["entry"]) or (not is_long and price <= c["entry"])
+            if entry_hit:
+                await notion_update_call_status(c["page_id"], "active", {
+                    "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
+                    "username": c["username"], "chat_id": c["chat_id"]
+                })
+                await notify(
+                    f"✅ ENTRY HIT!\n\n"
+                    f"📣 Call @{c['username']}\n"
+                    f"🪙 {c['symbol']} {'LONG 📈' if is_long else 'SHORT 📉'}\n\n"
+                    f"🎯 Entry  : ${c['entry']:,.4f}\n"
+                    f"🟢 TP     : ${c['tp']:,.4f} ({tp_pct:+.2f}%)\n"
+                    f"🔴 SL     : ${c['sl']:,.4f} ({sl_pct:+.2f}%)\n"
+                    f"💰 Harga  : ${price:,.4f}"
+                )
+
+        elif c["status"] == "active":
+            tp_hit = (is_long and price >= c["tp"]) or (not is_long and price <= c["tp"])
+            sl_hit = (is_long and price <= c["sl"]) or (not is_long and price >= c["sl"])
+
+            if tp_hit:
+                await notion_update_call_status(c["page_id"], "tp_hit", {
+                    "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
+                    "username": c["username"], "chat_id": c["chat_id"]
+                })
+                await notify(
+                    f"🚀 TP HIT! PROFIT!\n\n"
+                    f"📣 Call @{c['username']}\n"
+                    f"🪙 {c['symbol']} {'LONG 📈' if is_long else 'SHORT 📉'}\n\n"
+                    f"🎯 Entry : ${c['entry']:,.4f}\n"
+                    f"🟢 TP    : ${c['tp']:,.4f}\n"
+                    f"💰 Harga : ${price:,.4f}\n\n"
+                    f"✅ Profit: {tp_pct:+.2f}%"
+                )
+            elif sl_hit:
+                await notion_update_call_status(c["page_id"], "sl_hit", {
+                    "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
+                    "username": c["username"], "chat_id": c["chat_id"]
+                })
+                await notify(
+                    f"🔴 SL HIT! STOP LOSS!\n\n"
+                    f"📣 Call @{c['username']}\n"
+                    f"🪙 {c['symbol']} {'LONG 📉' if is_long else 'SHORT 📈'}\n\n"
+                    f"🎯 Entry : ${c['entry']:,.4f}\n"
+                    f"🔴 SL    : ${c['sl']:,.4f}\n"
+                    f"💰 Harga : ${price:,.4f}\n\n"
+                    f"❌ Loss: {sl_pct:+.2f}%"
+                )(context: ContextTypes.DEFAULT_TYPE):
     rows = await notion_query_all("price_alert")
     for row in rows:
         r = parse_row(row)
@@ -1323,10 +1665,17 @@ def main():
     app.add_handler(CommandHandler("dextrending", dextrending_cmd))
     app.add_handler(CommandHandler("dexnew", dexnew_cmd))
 
+    app.add_handler(CommandHandler("buy", buy_cmd))
+    app.add_handler(CommandHandler("sell", sell_cmd))
+    app.add_handler(CommandHandler("mycalls", mycalls_cmd))
+    app.add_handler(CommandHandler("allcalls", allcalls_cmd))
+    app.add_handler(CommandHandler("removecall", removecall_cmd))
+
     app.job_queue.run_repeating(check_price_alerts, interval=60, first=10)
     app.job_queue.run_repeating(check_funding_spikes, interval=3600, first=30)
     app.job_queue.run_repeating(check_oi_spikes, interval=3600, first=30)
     app.job_queue.run_repeating(check_dex_mcap_alerts, interval=300, first=20)
+    app.job_queue.run_repeating(check_calls, interval=60, first=15)
 
     print("Bot running...")
     app.run_polling()
