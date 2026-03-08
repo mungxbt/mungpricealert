@@ -326,6 +326,21 @@ def pct_emoji(v) -> str:
     except:
         return "⚪"
 
+def extract_twitter(pair: dict) -> str | None:
+    """Ambil username Twitter/X dari info pair DexScreener"""
+    # DexScreener simpan social links di field 'info'
+    info = pair.get("info") or {}
+    socials = info.get("socials") or []
+    for s in socials:
+        stype = (s.get("type") or "").lower()
+        url = s.get("url") or ""
+        if stype in ("twitter", "x") or "twitter.com" in url or "x.com" in url:
+            # ambil username dari URL
+            username = url.rstrip("/").split("/")[-1]
+            if username and username not in ("twitter.com", "x.com"):
+                return username
+    return None
+
 def format_dex_pair(pair: dict) -> str:
     base = pair.get("baseToken", {})
     symbol = base.get("symbol", "?")
@@ -350,6 +365,8 @@ def format_dex_pair(pair: dict) -> str:
     sells = txns.get("sells", 0)
     pair_url = pair.get("url", "")
 
+    twitter = extract_twitter(pair)
+
     msg  = f"🔍 *{symbol}* — {name}\n"
     msg += f"⛓ {chain.upper()} | 🏦 {dex}\n\n"
     msg += f"💰 Harga   : {format_price(price_usd)}\n"
@@ -362,6 +379,9 @@ def format_dex_pair(pair: dict) -> str:
     if fdv > 0:
         msg += f"📈 FDV       : ${fdv:,.0f}\n"
     msg += f"🔄 Txns 24h  : {buys} buy / {sells} sell\n"
+    if twitter:
+        msg += f"\n🐦 Twitter   : @{twitter}\n"
+        msg += f"🕵️ Cek Rick  : t.me/RickBurpBot?start=twit_{twitter}\n"
     if pair_url:
         msg += f"\n🔗 {pair_url}"
     return msg
