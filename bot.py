@@ -17,8 +17,12 @@ oi_cache = {}
 # NOTION PERSISTENCE
 # ─────────────────────────────────────────
 
-async def notion_add(user_id: int, type_: str, symbol: str, target: str = "", direction: str = ""):
+async def notion_add(user_id: int, type_: str, symbol: str, target: str = "", direction: str = "", chat_id: int = None):
     name = f"{type_}:{user_id}:{symbol}:{target}"
+    # simpan chat_id di direction field dengan separator | kalau ada
+    direction_val = direction
+    if chat_id and chat_id != user_id:
+        direction_val = f"{direction}|chat:{chat_id}"
     payload = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": {
@@ -27,7 +31,7 @@ async def notion_add(user_id: int, type_: str, symbol: str, target: str = "", di
             "type": {"select": {"name": type_}},
             "symbol": {"rich_text": [{"text": {"content": symbol}}]},
             "target": {"rich_text": [{"text": {"content": target}}]},
-            "direction": {"rich_text": [{"text": {"content": direction}}]},
+            "direction": {"rich_text": [{"text": {"content": direction_val}}]},
             "active": {"checkbox": True}
         }
     }
@@ -78,13 +82,29 @@ def parse_row(row: dict) -> dict:
     def txt(key):
         items = props.get(key, {}).get("rich_text", [])
         return items[0]["text"]["content"] if items else ""
+    
+    direction_raw = txt("direction")
+    user_id = int(txt("user_id"))
+    
+    # extract chat_id jika tersimpan di direction field
+    chat_id = user_id  # default: sama dengan user_id (personal chat)
+    direction = direction_raw
+    if "|chat:" in direction_raw:
+        parts = direction_raw.split("|chat:")
+        direction = parts[0]
+        try:
+            chat_id = int(parts[1])
+        except:
+            chat_id = user_id
+
     return {
         "page_id": row["id"],
-        "user_id": int(txt("user_id")),
+        "user_id": user_id,
+        "chat_id": chat_id,  # kirim notif ke sini
         "type": props.get("type", {}).get("select", {}).get("name", ""),
         "symbol": txt("symbol"),
         "target": txt("target"),
-        "direction": txt("direction"),
+        "direction": direction,
     }
 
 # ─────────────────────────────────────────
@@ -326,19 +346,59 @@ def pct_emoji(v) -> str:
     except:
         return "⚪"
 
-def extract_twitter(pair: dict) -> str | None:
-    """Ambil username Twitter/X dari info pair DexScreener"""
-    # DexScreener simpan social links di field 'info'
+def extract_twitter_from_pair(pair: dict) -> str | None:
+    """Coba ambil Twitter dari field info pair (kalau ada)"""
     info = pair.get("info") or {}
     socials = info.get("socials") or []
     for s in socials:
         stype = (s.get("type") or "").lower()
         url = s.get("url") or ""
         if stype in ("twitter", "x") or "twitter.com" in url or "x.com" in url:
-            # ambil username dari URL
             username = url.rstrip("/").split("/")[-1]
-            if username and username not in ("twitter.com", "x.com"):
+            if username and username not in ("twitter.com", "x.com", "i", "home"):
                 return username
+    return None
+
+async def fetch_twitter_from_profile(chain: str, address: str) -> str | None:
+    """Ambil Twitter dari token-profiles endpoint (lebih lengkap)"""
+    url = f"https://api.dexscreener.com/token-profiles/latest/v1"
+    # token-profiles tidak support query by address langsung,
+    # tapi kita bisa cek di token-boosts endpoint yang support by address
+    url2 = f"https://api.dexscreener.com/token-boosts/latest/v1"
+    
+    # Coba dari orders endpoint yang punya links
+    orders_url = f"https://api.dexscreener.com/orders/v1/{chain}/{address}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Cek di token-pairs dengan chain/address — kadang ada di sini
+            pairs_url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
+            async with session.get(pairs_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data if isinstance(data, list) else data.get("pairs", [])
+                    for p in (pairs or []):
+                        twitter = extract_twitter_from_pair(p)
+                        if twitter:
+                            return twitter
+    except Exception:
+        pass
+    return None
+
+async def extract_twitter(pair: dict) -> str | None:
+    """Ambil Twitter: coba dari pair dulu, kalau gak ada fetch dari profile"""
+    # 1. Coba dari data pair yang sudah ada
+    twitter = extract_twitter_from_pair(pair)
+    if twitter:
+        return twitter
+    
+    # 2. Coba fetch ulang dengan token-pairs endpoint yang lebih lengkap
+    chain = pair.get("chainId", "")
+    address = pair.get("baseToken", {}).get("address", "")
+    if chain and address:
+        twitter = await fetch_twitter_from_profile(chain, address)
+        if twitter:
+            return twitter
+    
     return None
 
 def format_dex_pair(pair: dict) -> str:
@@ -365,8 +425,6 @@ def format_dex_pair(pair: dict) -> str:
     sells = txns.get("sells", 0)
     pair_url = pair.get("url", "")
 
-    twitter = extract_twitter(pair)
-
     msg  = f"🔍 *{symbol}* — {name}\n"
     msg += f"⛓ {chain.upper()} | 🏦 {dex}\n\n"
     msg += f"💰 Harga   : {format_price(price_usd)}\n"
@@ -379,11 +437,20 @@ def format_dex_pair(pair: dict) -> str:
     if fdv > 0:
         msg += f"📈 FDV       : ${fdv:,.0f}\n"
     msg += f"🔄 Txns 24h  : {buys} buy / {sells} sell\n"
-    if twitter:
-        msg += f"\n🐦 Twitter   : @{twitter}\n"
-        msg += f"🕵️ Cek Rick  : t.me/RickBurpBot?start=twit_{twitter}\n"
     if pair_url:
         msg += f"\n🔗 {pair_url}"
+    return msg
+
+def format_dex_pair_with_twitter(pair: dict, twitter: str | None) -> str:
+    """Sama seperti format_dex_pair tapi include Twitter/Rick link"""
+    msg = format_dex_pair(pair)
+    if twitter:
+        # sisipkan sebelum link DexScreener
+        rick_line = f"\n🐦 Twitter : @{twitter}\n🕵️ Cek Rick: t.me/RickBurpBot?start=twit_{twitter}"
+        if "\n🔗" in msg:
+            msg = msg.replace("\n🔗", rick_line + "\n🔗")
+        else:
+            msg += rick_line
     return msg
 
 def funding_status(rate: float) -> str:
@@ -467,6 +534,7 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if len(context.args) < 2:
         await update.message.reply_text("Format: /alert BTC 90000")
         return
@@ -487,7 +555,7 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Alert {symbol} ${target:,.6f} sudah ada!")
             return
     direction = "above" if target > current else "below"
-    await notion_add(user_id, "price_alert", symbol, str(target), direction)
+    await notion_add(user_id, "price_alert", symbol, str(target), direction, chat_id=chat_id)
     arrow = "📈" if direction == "above" else "📉"
     total = len([r for r in existing if parse_row(r)["symbol"] == symbol]) + 1
     await update.message.reply_text(
@@ -568,6 +636,7 @@ async def funding_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /addfunding BTC")
         return
@@ -581,7 +650,7 @@ async def add_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parse_row(row)["symbol"] == symbol:
             await update.message.reply_text(f"⚠️ {symbol} sudah dimonitor.")
             return
-    await notion_add(user_id, "funding_watch", symbol)
+    await notion_add(user_id, "funding_watch", symbol, chat_id=chat_id)
     await update.message.reply_text(
         f"✅ Monitor funding rate {symbol} aktif!\n"
         f"Notif kalau spike > 0.1% atau < -0.1%"
@@ -638,6 +707,7 @@ async def oi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Format: /addoi BTC")
         return
@@ -651,7 +721,7 @@ async def add_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parse_row(row)["symbol"] == symbol:
             await update.message.reply_text(f"⚠️ {symbol} sudah dimonitor.")
             return
-    await notion_add(user_id, "oi_watch", symbol)
+    await notion_add(user_id, "oi_watch", symbol, chat_id=chat_id)
     oi_cache[symbol] = oi
     await update.message.reply_text(
         f"✅ Monitor OI {symbol} aktif!\n"
@@ -913,7 +983,9 @@ async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pairs_sorted = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)
     best = pairs_sorted[0]
 
-    await update.message.reply_text(format_dex_pair(best), parse_mode="Markdown")
+    # Cari Twitter — async
+    twitter = await extract_twitter(best)
+    await update.message.reply_text(format_dex_pair_with_twitter(best, twitter), parse_mode="Markdown")
 
     # Kalau ada beberapa pair (multi-dex), kasih info singkat
     if len(pairs_sorted) > 1:
@@ -1108,12 +1180,21 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
         if hit:
             await notion_delete(r["page_id"])
             arrow = "📈" if r["direction"] == "above" else "📉"
-            await context.bot.send_message(
-                chat_id=r["user_id"],
-                text=f"🚨 PRICE ALERT KENA!\n\n"
-                     f"{arrow} {r['symbol']} sudah sentuh ${target:,.6f}\n"
-                     f"💰 Harga sekarang: ${price:,.6f}"
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=r["chat_id"],
+                    text=f"🚨 PRICE ALERT KENA!\n\n"
+                         f"{arrow} {r['symbol']} sudah sentuh ${target:,.6f}\n"
+                         f"💰 Harga sekarang: ${price:,.6f}"
+                )
+            except Exception:
+                # fallback ke user personal jika grup gagal
+                await context.bot.send_message(
+                    chat_id=r["user_id"],
+                    text=f"🚨 PRICE ALERT KENA!\n\n"
+                         f"{arrow} {r['symbol']} sudah sentuh ${target:,.6f}\n"
+                         f"💰 Harga sekarang: ${price:,.6f}"
+                )
 
 async def check_funding_spikes(context: ContextTypes.DEFAULT_TYPE):
     rows = await notion_query_all("funding_watch")
@@ -1132,12 +1213,20 @@ async def check_funding_spikes(context: ContextTypes.DEFAULT_TYPE):
             for row2 in rows:
                 r2 = parse_row(row2)
                 if r2["symbol"] == symbol:
-                    await context.bot.send_message(
-                        chat_id=r2["user_id"],
-                        text=f"⚡ FUNDING SPIKE!\n\n"
-                             f"📊 {symbol}: {pct:+.4f}%\n"
-                             f"{funding_status(rate)}"
-                    )
+                    try:
+                        await context.bot.send_message(
+                            chat_id=r2["chat_id"],
+                            text=f"⚡ FUNDING SPIKE!\n\n"
+                                 f"📊 {symbol}: {pct:+.4f}%\n"
+                                 f"{funding_status(rate)}"
+                        )
+                    except Exception:
+                        await context.bot.send_message(
+                            chat_id=r2["user_id"],
+                            text=f"⚡ FUNDING SPIKE!\n\n"
+                                 f"📊 {symbol}: {pct:+.4f}%\n"
+                                 f"{funding_status(rate)}"
+                        )
 
 async def check_oi_spikes(context: ContextTypes.DEFAULT_TYPE):
     rows = await notion_query_all("oi_watch")
@@ -1159,13 +1248,22 @@ async def check_oi_spikes(context: ContextTypes.DEFAULT_TYPE):
                     r2 = parse_row(row2)
                     if r2["symbol"] == symbol:
                         arrow = "📈" if change_pct > 0 else "📉"
-                        await context.bot.send_message(
-                            chat_id=r2["user_id"],
-                            text=f"⚡ OI SPIKE!\n\n"
-                                 f"{arrow} {symbol} OI berubah {change_pct:+.2f}%\n"
-                                 f"OI sekarang: {oi:,.2f}\n"
-                                 f"OI sebelumnya: {last_oi:,.2f}"
-                        )
+                        try:
+                            await context.bot.send_message(
+                                chat_id=r2["chat_id"],
+                                text=f"⚡ OI SPIKE!\n\n"
+                                     f"{arrow} {symbol} OI berubah {change_pct:+.2f}%\n"
+                                     f"OI sekarang: {oi:,.2f}\n"
+                                     f"OI sebelumnya: {last_oi:,.2f}"
+                            )
+                        except Exception:
+                            await context.bot.send_message(
+                                chat_id=r2["user_id"],
+                                text=f"⚡ OI SPIKE!\n\n"
+                                     f"{arrow} {symbol} OI berubah {change_pct:+.2f}%\n"
+                                     f"OI sekarang: {oi:,.2f}\n"
+                                     f"OI sebelumnya: {last_oi:,.2f}"
+                            )
         oi_cache[symbol] = oi
 
 async def check_dex_mcap_alerts(context: ContextTypes.DEFAULT_TYPE):
@@ -1195,14 +1293,24 @@ async def check_dex_mcap_alerts(context: ContextTypes.DEFAULT_TYPE):
         if hit:
             await notion_delete(r["page_id"])
             arrow = "📈" if direction == "above" else "📉"
-            await context.bot.send_message(
-                chat_id=r["user_id"],
-                text=f"🚨 DEX MCAP ALERT KENA!\n\n"
-                     f"{arrow} {symbol} marketcap sentuh ${target_mcap:,.0f}\n"
-                     f"💰 MCap sekarang: ${current_mcap:,.0f}\n"
-                     f"⛓ Chain: {chain.upper()}\n"
-                     f"🔗 {best.get('url', '')}"
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=r["chat_id"],
+                    text=f"🚨 DEX MCAP ALERT KENA!\n\n"
+                         f"{arrow} {symbol} marketcap sentuh ${target_mcap:,.0f}\n"
+                         f"💰 MCap sekarang: ${current_mcap:,.0f}\n"
+                         f"⛓ Chain: {chain.upper()}\n"
+                         f"🔗 {best.get('url', '')}"
+                )
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=r["user_id"],
+                    text=f"🚨 DEX MCAP ALERT KENA!\n\n"
+                         f"{arrow} {symbol} marketcap sentuh ${target_mcap:,.0f}\n"
+                         f"💰 MCap sekarang: ${current_mcap:,.0f}\n"
+                         f"⛓ Chain: {chain.upper()}\n"
+                         f"🔗 {best.get('url', '')}"
+                )
 
 # ─────────────────────────────────────────
 # MAIN
