@@ -1577,40 +1577,70 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stats, /stats me, /stats 2025-03, /stats me 2025-03"""
+    """/stats, /stats me, /stats @budi, /stats 2025-03, /stats me 2025-03, /stats @budi 2025-03"""
     from datetime import datetime, timezone
 
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or str(user_id)
 
-    # Parse args: bisa "me", "2025-03", atau "me 2025-03"
-    args = [a.lower() for a in context.args]
-    personal = "me" in args
-    month_args = [a for a in args if a != "me"]
+    args = context.args or []
 
-    if month_args:
-        month = month_args[0]
-        try:
-            datetime.strptime(month, "%Y-%m")
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Format bulan salah.\n"
-                "Contoh: /stats | /stats me | /stats 2025-03 | /stats me 2025-03"
-            )
-            return
-    else:
+    # Cek apakah ada @username
+    target_username = None
+    for a in args:
+        if a.startswith("@"):
+            target_username = a[1:].lower()
+            break
+
+    args_lower = [a.lower() for a in args if not a.startswith("@")]
+    is_me = "me" in args_lower
+
+    # Extract bulan
+    month = None
+    for a in args_lower:
+        if a != "me":
+            try:
+                datetime.strptime(a, "%Y-%m")
+                month = a
+                break
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Format salah.\n"
+                    "Contoh:\n"
+                    "/stats — global bulan ini\n"
+                    "/stats me — stats lo sendiri\n"
+                    "/stats @budi — stats si budi\n"
+                    "/stats 2025-03 — global bulan tertentu\n"
+                    "/stats me 2025-03 — stats lo bulan tertentu\n"
+                    "/stats @budi 2025-03 — stats budi bulan tertentu"
+                )
+                return
+    if not month:
         month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     rows = await notion_query_history_by_month(month)
 
-    # Filter per user kalau /stats me
-    if personal:
-        rows = [r for r in rows if r["properties"].get("user_id", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "") == str(user_id)]
+    def get_prop_txt(row, key):
+        return (row["properties"].get(key, {}).get("rich_text", [{}])[0]
+                .get("text", {}).get("content", ""))
+
+    # Filter rows sesuai mode
+    if target_username:
+        rows = [r for r in rows if get_prop_txt(r, "username").lower() == target_username]
+        display_name = f"@{target_username}"
+        personal = True
+    elif is_me:
+        rows = [r for r in rows if get_prop_txt(r, "user_id") == str(user_id)]
+        display_name = f"@{username}"
+        personal = True
+    else:
+        display_name = None
+        personal = False
 
     if not rows:
         month_label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
-        if personal:
-            await update.message.reply_text(f"📊 Lo belum ada call yang closed di bulan {month_label}.")
+        if display_name:
+            await update.message.reply_text(f"📊 {display_name} belum ada call yang closed di bulan {month_label}.")
         else:
             await update.message.reply_text(f"📊 Belum ada call yang closed di bulan {month_label}.")
         return
@@ -1644,10 +1674,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_name = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
 
     if personal:
-        # Mode personal — no per-trader breakdown
+        label = display_name
         msg = (
-            f"📊 STATISTIK LO — {month_name}\n"
-            f"👤 @{username}\n"
+            f"📊 STATISTIK {label} — {month_name}\n"
             f"{'─' * 28}\n\n"
             f"📈 Total Call  : {total}\n"
             f"✅ TP Hit      : {len(wins)}\n"
@@ -1663,7 +1692,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction = "📈" if c["call_type"] == "buy" else "📉"
             msg += f"   {emoji} {c['symbol']} {direction} {c['pnl_pct']:+.2f}%\n"
     else:
-        # Mode global — tampilkan per trader breakdown
+        # Mode global — per trader breakdown
         user_stats = {}
         for c in calls:
             u = c["username"]
