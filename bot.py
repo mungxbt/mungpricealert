@@ -1237,15 +1237,41 @@ async def _process_call(update: Update, context, call_type: str):
 
     symbol = context.args[0].upper()
     try:
-        entry = float(context.args[1])
+        entry_arg = context.args[1].lower()
         if context.args[2].upper() != "TP" or context.args[4].upper() != "SL":
             raise ValueError
         tp = float(context.args[3])
         sl = float(context.args[5])
     except (ValueError, IndexError):
         cmd = "buy" if is_long else "sell"
-        await update.message.reply_text(f"❌ Format salah.\nContoh: /{cmd} BTC 75000 TP 80000 SL 73000")
+        await update.message.reply_text(
+            f"❌ Format salah.\n"
+            f"Contoh: /{cmd} BTC 75000 TP 80000 SL 73000\n"
+            f"Atau pakai harga sekarang: /{cmd} BTC now TP 80000 SL 73000"
+        )
         return
+
+    # Cek harga sekarang dulu (selalu butuh untuk validasi dan current price display)
+    current = await get_price(symbol)
+    if current is None:
+        await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Binance.")
+        return
+
+    # Entry: angka spesifik atau keyword now/haka = harga sekarang
+    use_current_price = entry_arg in ("now", "haka", "skrg", "market")
+    if use_current_price:
+        entry = current
+    else:
+        try:
+            entry = float(entry_arg)
+        except ValueError:
+            cmd = "buy" if is_long else "sell"
+            await update.message.reply_text(
+                f"❌ Entry harus angka atau 'now'.\n"
+                f"Contoh: /{cmd} BTC 75000 TP 80000 SL 73000\n"
+                f"Atau: /{cmd} BTC now TP 80000 SL 73000"
+            )
+            return
 
     # Validasi arah sesuai tipe call
     if is_long:
@@ -1262,11 +1288,6 @@ async def _process_call(update: Update, context, call_type: str):
         if sl <= entry:
             await update.message.reply_text("❌ Untuk SHORT/SELL, SL harus di atas entry.")
             return
-
-    current = await get_price(symbol)
-    if current is None:
-        await update.message.reply_text(f"❌ {symbol} tidak ditemukan di Binance.")
-        return
 
     # Hapus call lama user untuk coin + tipe yang sama
     existing = await notion_query(user_id, "call_tracker")
@@ -1285,22 +1306,27 @@ async def _process_call(update: Update, context, call_type: str):
 
     rr = abs(tp_pct / sl_pct) if sl_pct != 0 else 0
 
-    # Status awal
-    if is_long:
-        status = "active" if current >= entry else "waiting"
-    else:
+    # Status: now/haka → langsung active, selainnya cek posisi harga
+    if use_current_price:
+        status = "active"
+    elif is_long:
         status = "active" if current <= entry else "waiting"
+    else:
+        status = "active" if current >= entry else "waiting"
 
     await notion_add_call(user_id, symbol, entry, tp, sl, username, chat_id, status, call_type=call_type)
 
     direction_label = "LONG 📈" if is_long else "SHORT 📉"
-    status_label = "✅ ACTIVE — harga sudah di entry!" if status == "active" else "⏳ WAITING — menunggu harga sentuh entry"
+    entry_label = f"${entry:,.4f} (harga sekarang)" if use_current_price else f"${entry:,.4f}"
+    status_label = "✅ ACTIVE — entry di harga sekarang!" if use_current_price else \
+                   "✅ ACTIVE — harga sudah di entry!" if status == "active" else \
+                   "⏳ WAITING — menunggu harga sentuh entry"
 
     await update.message.reply_text(
         f"📣 {'BUY' if is_long else 'SELL'} CALL — {direction_label}\n"
         f"👤 @{username}\n\n"
         f"🪙 Coin   : {symbol}\n"
-        f"🎯 Entry  : ${entry:,.4f}\n"
+        f"🎯 Entry  : {entry_label}\n"
         f"🟢 TP     : ${tp:,.4f} ({tp_pct:+.2f}%)\n"
         f"🔴 SL     : ${sl:,.4f} ({sl_pct:+.2f}%)\n"
         f"⚖️ R/R    : 1:{rr:.2f}\n\n"
@@ -1449,7 +1475,9 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         if c["status"] == "waiting":
-            entry_hit = (is_long and price >= c["entry"]) or (not is_long and price <= c["entry"])
+            # Long: entry hit kalau harga turun ke entry
+            # Short: entry hit kalau harga naik ke entry
+            entry_hit = (is_long and price <= c["entry"]) or (not is_long and price >= c["entry"])
             if entry_hit:
                 await notion_update_call_status(c["page_id"], "active", {
                     "entry": c["entry"], "tp": c["tp"], "sl": c["sl"],
