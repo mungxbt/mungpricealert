@@ -1277,6 +1277,12 @@ async def _process_call(update: Update, context, call_type: str):
 
     tp_pct = ((tp - entry) / entry) * 100
     sl_pct = ((sl - entry) / entry) * 100
+
+    # Untuk short: balik tanda — TP di bawah = profit, SL di atas = loss
+    if not is_long:
+        tp_pct = -tp_pct
+        sl_pct = -sl_pct
+
     rr = abs(tp_pct / sl_pct) if sl_pct != 0 else 0
 
     # Status awal
@@ -1323,10 +1329,13 @@ async def mycalls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c = parse_call(row)
         if not c:
             continue
-        is_long = c["tp"] > c["entry"]
+        is_long = c.get("call_type", "buy") == "buy"
         direction = "LONG 📈" if is_long else "SHORT 📉"
         tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
         sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+        if not is_long:
+            tp_pct = -tp_pct
+            sl_pct = -sl_pct
         price = await get_price(c["symbol"])
         current_pnl = ""
         if price and c["status"] == "active":
@@ -1392,10 +1401,13 @@ async def allcalls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = "📣 Semua call aktif di sini:\n\n"
     for c in chat_calls:
-        is_long = c["tp"] > c["entry"]
+        is_long = c.get("call_type", "buy") == "buy"
         direction = "LONG 📈" if is_long else "SHORT 📉"
         tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
         sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+        if not is_long:
+            tp_pct = -tp_pct
+            sl_pct = -sl_pct
         status_map = {"waiting": "⏳", "active": "✅"}
         status_label = status_map.get(c["status"], "?")
         msg += (
@@ -1420,9 +1432,12 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
         if price is None:
             continue
 
-        is_long = c["tp"] > c["entry"]
+        is_long = c.get("call_type", "buy") == "buy"
         tp_pct = ((c["tp"] - c["entry"]) / c["entry"]) * 100
         sl_pct = ((c["sl"] - c["entry"]) / c["entry"]) * 100
+        if not is_long:
+            tp_pct = -tp_pct
+            sl_pct = -sl_pct
 
         async def notify(text, _c=c):
             try:
