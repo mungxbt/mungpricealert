@@ -1481,7 +1481,9 @@ async def check_calls(context: ContextTypes.DEFAULT_TYPE):
                     f"🔴 SL    : ${c['sl']:,.4f}\n"
                     f"💰 Harga : ${price:,.4f}\n\n"
                     f"❌ Loss: {sl_pct:+.2f}%"
-                )(context: ContextTypes.DEFAULT_TYPE):
+                )
+
+async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
     rows = await notion_query_all("price_alert")
     for row in rows:
         r = parse_row(row)
