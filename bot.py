@@ -436,7 +436,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🦎 DEX / MEMECOIN\n"
         "/dex PEPE — cari token by nama\n"
         "/dex solana <contract> — by contract\n"
-        "/dexalert <contract> <mcap> — alert marketcap\n"
+        "/dexalert <token> <mcap> — alert mcap (CA/nama/ticker)\n"
         "/listdexalerts — lihat dex alert\n"
         "/removedexalert <contract> — hapus alert\n"
         "/dextrending — token paling banyak di-boost\n"
@@ -931,57 +931,97 @@ async def dex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dexalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /dexalert <contract> <mcap_target> [chain]
-    Contoh: /dexalert 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU 1000000
+    /dexalert <CA|nama|ticker> <mcap_target> [chain]
+    Contoh:
+      /dexalert 7xKXtg...sgAsU 1000000
+      /dexalert jatevo 1000000
+      /dexalert JTVO 1000000
     """
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if len(context.args) < 2:
         await update.message.reply_text(
             "Set alert marketcap untuk memecoin!\n\n"
-            "Format: /dexalert <contract> <target_mcap>\n"
-            "Contoh:\n"
-            "/dexalert 7xKXtg...sgAsU 1000000\n"
-            "  → notif kalau mcap sentuh $1jt\n\n"
+            "Format: /dexalert <token> <target_mcap>\n\n"
+            "Bisa pakai:\n"
+            "• Contract address: /dexalert 7xKXtg...sgAsU 1000000\n"
+            "• Nama token      : /dexalert jatevo 1000000\n"
+            "• Ticker          : /dexalert JTVO 1000000\n\n"
             "Optional chain (default: auto-detect):\n"
-            "/dexalert <contract> <mcap> solana"
+            "/dexalert <token> <mcap> solana"
         )
         return
 
-    contract = context.args[0]
+    input_token = context.args[0]
     try:
         target_mcap = float(context.args[1].replace(",", ""))
     except ValueError:
         await update.message.reply_text("❌ Target mcap harus angka. Contoh: 1000000 atau 1500000")
         return
-    
-    chain = context.args[2].lower() if len(context.args) > 2 else "auto"
 
-    await update.message.reply_text("🔍 Checking token...")
+    chain_arg = context.args[2].lower() if len(context.args) > 2 else "auto"
 
-    # Cari pair
-    if chain == "auto":
-        pairs = await dex_by_contract("solana", contract)
-        if not pairs:
-            pairs = await dex_by_contract("ethereum", contract)
-        if not pairs:
-            pairs = await dex_by_contract("bsc", contract)
-        detected_chain = pairs[0].get("chainId", "unknown") if pairs else "unknown"
+    await update.message.reply_text("🔍 Mencari token...")
+
+    chains = ["solana", "bsc", "ethereum", "base", "arbitrum", "polygon", "avax"]
+    is_contract = len(input_token) > 30
+
+    pairs = []
+    detected_chain = "unknown"
+    contract = input_token  # default fallback
+
+    if is_contract:
+        # Input adalah contract address
+        if chain_arg != "auto" and chain_arg in chains:
+            pairs = await dex_by_contract(chain_arg, input_token)
+            detected_chain = chain_arg
+        else:
+            for ch in ["solana", "ethereum", "bsc", "base", "arbitrum"]:
+                pairs = await dex_by_contract(ch, input_token)
+                if pairs:
+                    detected_chain = ch
+                    break
     else:
-        pairs = await dex_by_contract(chain, contract)
-        detected_chain = chain
+        # Input adalah nama atau ticker — search dulu
+        query = input_token
+        all_pairs = await dex_search_pairs(query)
+
+        query_upper = query.upper()
+        exact = [
+            p for p in all_pairs
+            if p.get("baseToken", {}).get("symbol", "").upper() == query_upper
+            or p.get("baseToken", {}).get("name", "").upper() == query.upper()
+        ]
+        if exact:
+            pairs = exact
+        else:
+            filtered = [
+                p for p in all_pairs
+                if query_upper in p.get("baseToken", {}).get("symbol", "").upper()
+                or query.lower() in p.get("baseToken", {}).get("name", "").lower()
+            ]
+            pairs = filtered if filtered else all_pairs
+
+        # Filter by chain kalau dispesifikkan
+        if chain_arg != "auto" and chain_arg in chains:
+            pairs = [p for p in pairs if p.get("chainId", "").lower() == chain_arg]
 
     if not pairs:
-        await update.message.reply_text("❌ Token tidak ditemukan. Pastikan contract address benar.")
+        await update.message.reply_text(
+            "❌ Token tidak ditemukan di DexScreener.\n"
+            "Coba gunakan contract address untuk hasil lebih akurat."
+        )
         return
 
-    # Ambil pair dengan volume terbesar
+    # Ambil pair terbaik = volume tertinggi
     best = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0), reverse=True)[0]
     base = best.get("baseToken", {})
     symbol = base.get("symbol", "?")
-    current_mcap = float(best.get("marketCap") or 0)
+    contract = base.get("address", input_token)
+    detected_chain = best.get("chainId", detected_chain)
 
+    current_mcap = float(best.get("marketCap") or 0)
     if current_mcap == 0:
-        # fallback: fdv
         current_mcap = float(best.get("fdv") or 0)
 
     if current_mcap == 0:
@@ -992,11 +1032,9 @@ async def dexalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     direction = "above" if target_mcap > current_mcap else "below"
-    
-    # Simpan ke Notion: type=dex_mcap_alert, symbol=contract, target=mcap_target, direction=chain|direction
     direction_str = f"{detected_chain}|{direction}"
-    
-    # cek duplikat
+
+    # Cek duplikat
     existing = await notion_query(user_id, "dex_mcap_alert")
     for row in existing:
         r = parse_row(row)
@@ -1004,16 +1042,17 @@ async def dexalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Alert {symbol} mcap ${target_mcap:,.0f} sudah ada!")
             return
 
-    await notion_add(user_id, "dex_mcap_alert", contract, str(target_mcap), direction_str)
+    await notion_add(user_id, "dex_mcap_alert", contract, str(target_mcap), direction_str, chat_id=chat_id)
 
     arrow = "📈" if direction == "above" else "📉"
+    short_ca = f"{contract[:8]}...{contract[-6:]}" if len(contract) > 14 else contract
     await update.message.reply_text(
         f"✅ DEX Market Cap Alert set!\n\n"
         f"🪙 Token  : {symbol}\n"
         f"⛓ Chain  : {detected_chain.upper()}\n"
         f"💰 MCap sekarang : ${current_mcap:,.0f}\n"
         f"{arrow} Target MCap    : ${target_mcap:,.0f}\n"
-        f"📊 Pair address  : {contract[:8]}...{contract[-6:]}"
+        f"📊 Contract      : {short_ca}"
     )
 
 async def listdexalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
